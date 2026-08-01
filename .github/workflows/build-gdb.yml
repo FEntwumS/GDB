@@ -1,10 +1,10 @@
 # .github/workflows/build-gdb.yml
 #
-# Baut GDB aus den offiziellen GNU-Quellen und legt das Ergebnis als
-# Artefakt ab. Bei einem Tag-Push (v*) wird es zusaetzlich an das
-# GitHub-Release angehaengt.
+# Builds GDB from the official GNU sources and stores the result as an
+# artifact. When a tag is pushed (v*), it is also added to the
+# GitHub release.
 #
-# Stand: nur linux-x64. macOS und Windows folgen als weitere Jobs.
+# Current status: linux-x64 only. macOS and Windows will follow as additional jobs.
 #
 # Die Uebersetzung erfolgt in einem ubuntu:20.04-Container, nicht auf einem
 # aktuellen Runner. Grund ist die Bindung an die Bibliotheken des
@@ -17,10 +17,10 @@
 name: Build GDB for linux-x64
 
 on:
-  workflow_dispatch:        # manuell ausloesbar (Actions-Tab -> Run workflow)
+  workflow_dispatch:        # triggerable (Actions-Tab -> Run workflow)
     inputs:
       with_python:
-        description: 'Python-Scripting einbinden (fuer den CLI-Workflow der Vorarbeit)'
+        description: 'Enable Python-Scripting'
         type: boolean
         default: true
   push:
@@ -32,23 +32,21 @@ on:
 
 env:
   GDB_VERSION: '17.2'
-  # TODO: nach dem ersten Lauf die im Log ausgegebene Pruefsumme hier eintragen.
-  # Solange leer, wird die Verifikation uebersprungen (nur Warnung).
   GDB_SHA256: '1c036c0d72e4b3d1fb5c94c88632add6f9d76f4d7c4d2ea793c12a9f19a3228c'
 
   # Python-Scripting: 'true' bindet den Interpreter ein.
   #
-  #   true  -> Die Binary kann GDB-Python-Skripte ausfuehren, also auch die
-  #            RAM-Befehle der Vorarbeit. Noetig, um den bestehenden
-  #            CLI-/Eclipse-Workflow gegen das Artefakt zu testen.
-  #            ACHTUNG: erzeugt eine dynamische Abhaengigkeit zu libpython
-  #            in genau der Version der Bauumgebung -- hier 3.8, passend
-  #            zum VM-Abbild. Auf Systemen ohne diese Version startet die
-  #            Binary nicht. Die Standardbibliothek wird NICHT mitgeliefert.
-  #   false -> schlankeres, abhaengigkeitsaermeres Artefakt. Ausreichend,
-  #            sobald die Speicherdarstellung in der Oberflaeche erfolgt.
+  #   true  -> The binary can execute GDB Python scripts, including the
+  #            RAM commands from the preliminary work (e.g. Dolata's Workflow).
+  #            ATTENTION: Creates a dynamic dependency on libpython
+  #            in the exact version of the build environment—in this case, 3.8, which matches
+  #            the VM image. On systems without this version, the
+  #            binary will not start. The standard library is NOT included.
   #
-  # Bei manuellem Start ueberschreibt die Eingabe oben diesen Wert.
+  #   false -> a more streamlined artifact with fewer dependencies. Sufficient,
+  #            as long as the data is displayed in the user interface.
+  #
+  # If you start the workflow manually, the value entered above will be overwritten.
   WITH_PYTHON: 'true'
 
 jobs:
@@ -59,15 +57,14 @@ jobs:
       image: ubuntu:20.04
 
     steps:
-      # Im Container laufen wir als root -- kein sudo. Ausserdem bringt das
-      # nackte Image weder git noch curl mit, weshalb die Pakete VOR dem
-      # Checkout installiert werden muessen.
-      - name: Build-Abhaengigkeiten installieren
+      # In the container, we run as root — no sudo needed. Also, the bare image doesn't
+      # include either git or curl, which is why the packages must be installed BEFORE the checkout!
+      - name: Install Build Dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 20.04 ist seit Mai 2025 aus dem regulaeren Wartungszeitraum.
-          # Falls die Paketquellen umgezogen sind, hier umbiegen:
+          # 20.04 has been out of the regular support period since May 2025.
+          # If the package sources have been moved, make the following changes here:
           # sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; \
           #         s|security.ubuntu.com|old-releases.ubuntu.com|g' \
           #     /etc/apt/sources.list
@@ -93,10 +90,10 @@ jobs:
           ldd --version | head -n 1
           gcc --version | head -n 1
 
-      - name: Repository auschecken
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Variante bestimmen
+      - name: Identify if Python variant
         id: variant
         run: |
           # Eingabe des manuellen Starts hat Vorrang vor dem env-Default.
@@ -115,7 +112,7 @@ jobs:
             echo "Variante: OHNE Python-Scripting"
           fi
 
-      - name: Python installieren (nur bei aktiviertem Scripting)
+      - name: Install Python (only if scripting is enabled)
         if: steps.variant.outputs.with_python == 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -124,13 +121,13 @@ jobs:
           echo "--- Python der Bauumgebung ---"
           /usr/bin/python3 --version
 
-      - name: Quellen herunterladen
+      - name: Download Sources
         run: |
           curl -fLO "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz"
           echo "Tatsaechliche Pruefsumme:"
           sha256sum "gdb-${GDB_VERSION}.tar.xz"
 
-      - name: Pruefsumme verifizieren
+      - name: Verify Checksum
         run: |
           if [ -z "${GDB_SHA256}" ]; then
             echo "::warning::GDB_SHA256 ist leer - Verifikation uebersprungen."
