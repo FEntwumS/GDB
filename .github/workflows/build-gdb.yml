@@ -82,6 +82,17 @@ jobs:
             --disable-werror \
             LDFLAGS="-static-libstdc++ -static-libgcc"
 
+      - name: Diagnose configure
+        run: |
+          echo "=== Inhalt von build/ ==="
+          ls -la build/
+          echo "=== Unterverzeichnisse ==="
+          ls -d build/*/ || echo "(keine)"
+          echo "=== configure-Ausgabe: Ausschluesse ==="
+          grep -n -iE "noconfigdirs|not supported|skipping" build/config.log | head -n 20
+          echo "=== Makefile: konfigurierte Verzeichnisse ==="
+          grep -n "^configdirs" build/Makefile | head -n 5
+
       - name: Pruefen, ob das gdb-Modul konfiguriert wurde
         # Auf Darwin landete gdb still in noconfigdirs. Auf Linux sollte das
         # nicht passieren -- wir pruefen es trotzdem, damit ein solcher Fall
