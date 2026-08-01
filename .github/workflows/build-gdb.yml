@@ -1,0 +1,148 @@
+# .github/workflows/build-gdb.yml
+#
+# Baut GDB aus den offiziellen GNU-Quellen und legt das Ergebnis als
+# Artefakt ab. Bei einem Tag-Push (v*) wird es zusaetzlich an das
+# GitHub-Release angehaengt.
+#
+# Stand: nur linux-x64. macOS und Windows folgen als weitere Eintraege.
+
+name: Build GDB
+
+on:
+  workflow_dispatch:        # manuell ausloesbar (Actions-Tab -> Run workflow)
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/build-gdb.yml'
+
+env:
+  GDB_VERSION: '17.2'
+  # TODO: nach dem ersten Lauf die im Log ausgegebene Pruefsumme hier eintragen.
+  # Solange leer, wird die Verifikation uebersprungen (nur Warnung).
+  GDB_SHA256: ''
+
+jobs:
+  build-linux:
+    name: linux-x64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Build-Abhaengigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            texinfo \
+            libgmp-dev \
+            libmpfr-dev \
+            libexpat1-dev \
+            zlib1g-dev \
+            libncurses-dev
+
+      - name: Quellen herunterladen
+        run: |
+          curl -fLO "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz"
+          echo "Tatsaechliche Pruefsumme:"
+          sha256sum "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: Pruefsumme verifizieren
+        run: |
+          if [ -z "${GDB_SHA256}" ]; then
+            echo "::warning::GDB_SHA256 ist leer - Verifikation uebersprungen."
+            echo "Trage die oben ausgegebene Summe in den env-Block ein."
+          else
+            echo "${GDB_SHA256}  gdb-${GDB_VERSION}.tar.xz" | sha256sum -c -
+          fi
+
+      - name: Entpacken
+        run: tar xf "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: configure
+        run: |
+          mkdir build && cd build
+          ../gdb-${GDB_VERSION}/configure \
+            --prefix="${GITHUB_WORKSPACE}/gdb-linux-x64" \
+            --enable-targets=all \
+            --with-expat \
+            --with-system-zlib \
+            --without-python \
+            --disable-binutils \
+            --disable-gas \
+            --disable-ld \
+            --disable-gold \
+            --disable-gprof \
+            --disable-sim \
+            --disable-nls \
+            --disable-source-highlight \
+            --disable-werror \
+            LDFLAGS="-static-libstdc++ -static-libgcc"
+
+      - name: Pruefen, ob das gdb-Modul konfiguriert wurde
+        # Auf Darwin landete gdb still in noconfigdirs. Auf Linux sollte das
+        # nicht passieren -- wir pruefen es trotzdem, damit ein solcher Fall
+        # sofort auffaellt statt erst beim leeren Artefakt.
+        run: |
+          if [ ! -d build/gdb ]; then
+            echo "::error::build/gdb existiert nicht - configure hat GDB uebersprungen."
+            grep -n "not supported" build/config.log || true
+            exit 1
+          fi
+          echo "OK: build/gdb vorhanden"
+
+      - name: make
+        run: |
+          cd build
+          make -j"$(nproc)"
+          make install
+          strip "${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+
+      - name: Verifikation
+        run: |
+          GDB="${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+
+          echo "--- Version ---"
+          "$GDB" --version | head -n 1
+
+          echo "--- Laufzeitabhaengigkeiten ---"
+          ldd "$GDB"
+
+          echo "--- Konfiguration ---"
+          "$GDB" --configuration
+
+          echo "--- expat ---"
+          "$GDB" --configuration | grep -q -- "--with-expat" \
+            && echo "OK: expat aktiv" \
+            || { echo "::error::expat fehlt"; exit 1; }
+
+          echo "--- m68k (Traegerarchitektur des SVNR) ---"
+          "$GDB" --batch -nx --ex 'set architecture' 2>&1 | grep -q 'm68k' \
+            && echo "OK: m68k in der Architekturliste" \
+            || { echo "::error::m68k fehlt - targets=all wirkungslos?"; exit 1; }
+
+      - name: Paketieren
+        run: |
+          tar -czf "gdb-linux-x64.tar.gz" gdb-linux-x64
+          sha256sum "gdb-linux-x64.tar.gz" | tee "gdb-linux-x64.tar.gz.sha256"
+          ls -lh gdb-linux-x64.tar.gz
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdb-linux-x64
+          path: |
+            gdb-linux-x64.tar.gz
+            gdb-linux-x64.tar.gz.sha256
+          retention-days: 30
+
+      - name: An Release anhaengen (nur bei Tag-Push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gdb-linux-x64.tar.gz
+            gdb-linux-x64.tar.gz.sha256
