@@ -34,7 +34,7 @@ env:
   GDB_VERSION: '17.2'
   # TODO: nach dem ersten Lauf die im Log ausgegebene Pruefsumme hier eintragen.
   # Solange leer, wird die Verifikation uebersprungen (nur Warnung).
-  GDB_SHA256: ''
+  GDB_SHA256: '1c036c0d72e4b3d1fb5c94c88632add6f9d76f4d7c4d2ea793c12a9f19a3228c'
 
   # Python-Scripting: 'true' bindet den Interpreter ein.
   #
