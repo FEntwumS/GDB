@@ -6,15 +6,23 @@
 #
 # Stand: nur linux-x64. macOS und Windows folgen als weitere Jobs.
 #
-# TODO (nach dem ersten gruenen Lauf): Job in einen ubuntu:20.04-Container
-# verlegen, damit gegen die aeltere glibc gebunden wird. Erst dann laeuft
-# das Artefakt auch auf dem in der Lehre eingesetzten VM-Abbild.
-# Aktuell bindet der Build gegen die glibc von ubuntu-22.04.
+# Die Uebersetzung erfolgt in einem ubuntu:20.04-Container, nicht auf einem
+# aktuellen Runner. Grund ist die Bindung an die Bibliotheken des
+# Host-Systems: Deren Binaerkompatibilitaet gilt nur aufwaerts, ein auf
+# einer neueren Distribution erzeugtes Artefakt liesse sich auf dem in der
+# Lehre eingesetzten VM-Abbild (Ubuntu 20.04) nicht starten. Umgekehrt
+# laeuft ein hier erzeugtes Artefakt auch auf neueren Systemen.
+# Betrifft sowohl glibc als auch -- bei aktiviertem Scripting -- libpython.
 
 name: Build GDB for linux-x64
 
 on:
   workflow_dispatch:        # manuell ausloesbar (Actions-Tab -> Run workflow)
+    inputs:
+      with_python:
+        description: 'Python-Scripting einbinden (fuer den CLI-Workflow der Vorarbeit)'
+        type: boolean
+        default: true
   push:
     tags:
       - 'v*'
@@ -28,26 +36,93 @@ env:
   # Solange leer, wird die Verifikation uebersprungen (nur Warnung).
   GDB_SHA256: ''
 
+  # Python-Scripting: 'true' bindet den Interpreter ein.
+  #
+  #   true  -> Die Binary kann GDB-Python-Skripte ausfuehren, also auch die
+  #            RAM-Befehle der Vorarbeit. Noetig, um den bestehenden
+  #            CLI-/Eclipse-Workflow gegen das Artefakt zu testen.
+  #            ACHTUNG: erzeugt eine dynamische Abhaengigkeit zu libpython
+  #            in genau der Version der Bauumgebung -- hier 3.8, passend
+  #            zum VM-Abbild. Auf Systemen ohne diese Version startet die
+  #            Binary nicht. Die Standardbibliothek wird NICHT mitgeliefert.
+  #   false -> schlankeres, abhaengigkeitsaermeres Artefakt. Ausreichend,
+  #            sobald die Speicherdarstellung in der Oberflaeche erfolgt.
+  #
+  # Bei manuellem Start ueberschreibt die Eingabe oben diesen Wert.
+  WITH_PYTHON: 'true'
+
 jobs:
   build-linux:
     name: linux-x64
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
 
     steps:
-      - name: Repository auschecken
-        uses: actions/checkout@v4
-
+      # Im Container laufen wir als root -- kein sudo. Ausserdem bringt das
+      # nackte Image weder git noch curl mit, weshalb die Pakete VOR dem
+      # Checkout installiert werden muessen.
       - name: Build-Abhaengigkeiten installieren
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # 20.04 ist seit Mai 2025 aus dem regulaeren Wartungszeitraum.
+          # Falls die Paketquellen umgezogen sind, hier umbiegen:
+          # sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; \
+          #         s|security.ubuntu.com|old-releases.ubuntu.com|g' \
+          #     /etc/apt/sources.list
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
             build-essential \
+            git \
+            curl \
+            ca-certificates \
+            xz-utils \
+            file \
+            binutils \
             texinfo \
             libgmp-dev \
             libmpfr-dev \
             libexpat1-dev \
             zlib1g-dev \
             libncurses-dev
+
+          echo "--- Umgebung ---"
+          cat /etc/os-release | head -n 2
+          ldd --version | head -n 1
+          gcc --version | head -n 1
+
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Variante bestimmen
+        id: variant
+        run: |
+          # Eingabe des manuellen Starts hat Vorrang vor dem env-Default.
+          WP="${{ github.event.inputs.with_python }}"
+          if [ -z "$WP" ]; then WP="${WITH_PYTHON}"; fi
+
+          if [ "$WP" = "true" ]; then
+            echo "python_flag=--with-python=/usr/bin/python3" >> "$GITHUB_OUTPUT"
+            echo "suffix=-py" >> "$GITHUB_OUTPUT"
+            echo "with_python=true" >> "$GITHUB_OUTPUT"
+            echo "Variante: MIT Python-Scripting"
+          else
+            echo "python_flag=--without-python" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "with_python=false" >> "$GITHUB_OUTPUT"
+            echo "Variante: OHNE Python-Scripting"
+          fi
+
+      - name: Python installieren (nur bei aktiviertem Scripting)
+        if: steps.variant.outputs.with_python == 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get install -y --no-install-recommends python3-dev
+          echo "--- Python der Bauumgebung ---"
+          /usr/bin/python3 --version
 
       - name: Quellen herunterladen
         run: |
@@ -75,7 +150,7 @@ jobs:
             --enable-targets=all \
             --with-expat \
             --with-system-zlib \
-            --without-python \
+            ${{ steps.variant.outputs.python_flag }} \
             --disable-binutils \
             --disable-gas \
             --disable-ld \
@@ -131,7 +206,7 @@ jobs:
           ldd "$GDB"
 
           echo "--- benoetigte glibc-Version (hoechste referenzierte Symbolversion) ---"
-          # Bestimmt, ab welcher glibc das Artefakt laeuft.
+          # Erwartet: nicht hoeher als 2.31 (Ubuntu 20.04).
           objdump -T "$GDB" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 3
 
           echo "--- Konfiguration ---"
@@ -147,19 +222,41 @@ jobs:
             && echo "OK: m68k in der Architekturliste" \
             || { echo "::error::m68k fehlt - targets=all wirkungslos?"; exit 1; }
 
+      - name: Python-Funktionstest
+        if: steps.variant.outputs.with_python == 'true'
+        run: |
+          GDB="${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+
+          # Nicht nur "einkompiliert", sondern tatsaechlich lauffaehig:
+          # der Interpreter muss seine Standardbibliothek finden.
+          OUT="$("$GDB" -batch -nx -ex "python print('py ok')" 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "py ok" \
+            && echo "OK: Python-Interpreter funktionsfaehig" \
+            || { echo "::error::Python eingebunden, aber nicht lauffaehig"; exit 1; }
+
+          echo "--- libpython-Abhaengigkeit ---"
+          # Das Zielsystem muss genau diese Version bereitstellen.
+          # Erwartet: libpython3.8 (wie im VM-Abbild).
+          ldd "$GDB" | grep -i python \
+            || echo "(keine dynamische libpython-Referenz gefunden)"
+
       - name: Paketieren
         run: |
-          tar -czf "gdb-linux-x64.tar.gz" gdb-linux-x64
-          sha256sum "gdb-linux-x64.tar.gz" | tee "gdb-linux-x64.tar.gz.sha256"
-          ls -lh gdb-linux-x64.tar.gz
+          NAME="gdb-linux-x64${{ steps.variant.outputs.suffix }}"
+          mv gdb-linux-x64 "$NAME"
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
+          ls -lh "${NAME}.tar.gz"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
 
       - name: Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
-          name: gdb-linux-x64
+          name: ${{ env.ARTIFACT_NAME }}
           path: |
-            gdb-linux-x64.tar.gz
-            gdb-linux-x64.tar.gz.sha256
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
           retention-days: 30
 
       - name: An Release anhaengen (nur bei Tag-Push)
@@ -167,5 +264,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            gdb-linux-x64.tar.gz
-            gdb-linux-x64.tar.gz.sha256
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
