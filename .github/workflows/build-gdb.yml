@@ -4,9 +4,14 @@
 # Artefakt ab. Bei einem Tag-Push (v*) wird es zusaetzlich an das
 # GitHub-Release angehaengt.
 #
-# Stand: nur linux-x64. macOS und Windows folgen als weitere Eintraege.
+# Stand: nur linux-x64. macOS und Windows folgen als weitere Jobs.
+#
+# TODO (nach dem ersten gruenen Lauf): Job in einen ubuntu:20.04-Container
+# verlegen, damit gegen die aeltere glibc gebunden wird. Erst dann laeuft
+# das Artefakt auch auf dem in der Lehre eingesetzten VM-Abbild.
+# Aktuell bindet der Build gegen die glibc von ubuntu-22.04.
 
-name: Build GDB
+name: Build GDB for linux-x64
 
 on:
   workflow_dispatch:        # manuell ausloesbar (Actions-Tab -> Run workflow)
@@ -82,28 +87,21 @@ jobs:
             --disable-werror \
             LDFLAGS="-static-libstdc++ -static-libgcc"
 
-      - name: Diagnose configure
+      - name: Pruefen, ob GDB im Bauplan enthalten ist
+        # Der Top-Level-configure legt die Untermodul-Verzeichnisse noch
+        # nicht an -- das passiert erst waehrend "make". Geprueft wird
+        # deshalb das generierte Makefile: Landet gdb in noconfigdirs
+        # (wie auf Apple Silicon beobachtet), fehlt dort das Bauziel.
         run: |
-          echo "=== Inhalt von build/ ==="
-          ls -la build/
-          echo "=== Unterverzeichnisse ==="
-          ls -d build/*/ || echo "(keine)"
-          echo "=== configure-Ausgabe: Ausschluesse ==="
-          grep -n -iE "noconfigdirs|not supported|skipping" build/config.log | head -n 20
-          echo "=== Makefile: konfigurierte Verzeichnisse ==="
-          grep -n "^configdirs" build/Makefile | head -n 5
-
-      - name: Pruefen, ob das gdb-Modul konfiguriert wurde
-        # Auf Darwin landete gdb still in noconfigdirs. Auf Linux sollte das
-        # nicht passieren -- wir pruefen es trotzdem, damit ein solcher Fall
-        # sofort auffaellt statt erst beim leeren Artefakt.
-        run: |
-          if [ ! -d build/gdb ]; then
-            echo "::error::build/gdb existiert nicht - configure hat GDB uebersprungen."
-            grep -n "not supported" build/config.log || true
+          if grep -qE '^[[:space:]]*maybe-all-gdb' build/Makefile; then
+            echo "OK: gdb ist im Bauplan enthalten"
+          else
+            echo "::error::gdb fehlt im generierten Makefile."
+            echo "--- Hinweise aus config.log ---"
+            grep -n -iE "noconfigdirs|not supported|skipping" build/config.log \
+              | head -n 20 || true
             exit 1
           fi
-          echo "OK: build/gdb vorhanden"
 
       - name: make
         run: |
@@ -111,6 +109,16 @@ jobs:
           make -j"$(nproc)"
           make install
           strip "${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+
+      - name: Diagnose nach make
+        # Nur zur Nachvollziehbarkeit: welche Module wurden tatsaechlich
+        # gebaut, und was ist im Installationsverzeichnis gelandet?
+        if: always()
+        run: |
+          echo "=== gebaute Module ==="
+          ls -d build/*/ 2>/dev/null || echo "(keine)"
+          echo "=== Installationsverzeichnis ==="
+          find "${GITHUB_WORKSPACE}/gdb-linux-x64" -maxdepth 2 2>/dev/null || true
 
       - name: Verifikation
         run: |
@@ -121,6 +129,10 @@ jobs:
 
           echo "--- Laufzeitabhaengigkeiten ---"
           ldd "$GDB"
+
+          echo "--- benoetigte glibc-Version (hoechste referenzierte Symbolversion) ---"
+          # Bestimmt, ab welcher glibc das Artefakt laeuft.
+          objdump -T "$GDB" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 3
 
           echo "--- Konfiguration ---"
           "$GDB" --configuration
