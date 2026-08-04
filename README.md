@@ -13,15 +13,23 @@ SvNR debugger plugin uses.
 | Platform     | Version | Release asset               | Produced by             |
 |--------------|---------|-----------------------------|-------------------------|
 | linux-x64    | 17.2    | `gdb-linux-x64-py.tar.gz`   | CI (GitHub Actions)     |
-| macOS ARM64  | 17.2    | `gdb-macos-arm64.tar.gz`    | locally (`build-gdb.sh`)|
+| macOS ARM64  | 17.2    | `gdb-macos-arm64-py.tar.gz` | CI (GitHub Actions)     |
 
 Every archive comes with a `.sha256` file holding its checksum. Windows x64
 will be added as a further CI job in the same fashion.
 
+Note on macOS: the CI job builds and ad-hoc signs the binary, but does **not**
+relocate it yet — it still links against the runner's Homebrew dylibs. Until
+that is added, `build-gdb.sh` remains the path to a bundle that is portable to
+machines without Homebrew.
+
 ## Release process
 
-Linux binaries are no longer produced on a developer machine but in CI. The
-authoritative definition is the workflow `.github/workflows/build-gdb.yml`.
+Binaries are no longer produced on a developer machine but in CI. The
+authoritative definition is the workflow `.github/workflows/build-gdb.yml`,
+which holds one explicit job per platform (`build-linux`, `build-macos`) —
+deliberately no matrix, since package management, configure flags and
+verification differ too much per platform.
 
 **Triggering a release** — a tag matching `v*` starts the workflow:
 
@@ -32,7 +40,7 @@ The workflow builds GDB from the official GNU sources, verifies the result,
 and automatically attaches the archive and its checksum to the GitHub release
 for that tag.
 
-**Trial run without a release** — Actions tab → *Build GDB for linux-x64* →
+**Trial run without a release** — Actions tab → *Build GDB* →
 *Run workflow*. The `with_python` switch there also allows building the
 variant without Python scripting. The result is kept for 30 days as a
 workflow artifact, without creating a release.
@@ -40,7 +48,7 @@ workflow artifact, without creating a release.
 The GDB version is maintained in the workflow's `env` block (`GDB_VERSION`,
 `GDB_SHA256`).
 
-### Why an ubuntu:20.04 container
+### Linux: why an ubuntu:20.04 container
 
 The job runs on `ubuntu-latest` but builds inside an `ubuntu:20.04` container.
 The reason is the binding to the host system's libraries: their binary
@@ -48,6 +56,28 @@ compatibility only holds upwards. An artifact produced on a newer distribution
 would not start on the VM image used in teaching (Ubuntu 20.04) — conversely,
 an artifact produced here also runs on newer systems. This affects `glibc`
 (2.31 at most) and — with scripting enabled — `libpython` (3.8).
+
+### macOS: why `--target=m68k-elf` is mandatory
+
+The job runs on `macos-14` (Apple Silicon). A *native* GDB build fails there:
+the top-level configure moves `gdb` into `noconfigdirs` when host and target
+are identical, because native debugging is unsupported on arm64 Darwin. Passing
+`--target=m68k-elf` makes host and target differ and keeps `gdb` in the build
+plan — and m68k is the architecture the SvNR needs anyway. The
+*Check that GDB is part of the build plan* step exists to catch exactly this
+failure mode before `make` runs.
+
+Two consequences of the cross build:
+
+- the binary is installed as `m68k-elf-gdb`; the workflow renames it to
+  `bin/gdb`, which is what the plugin expects
+- after `strip` the binary is ad-hoc signed (`codesign --force --sign -`),
+  otherwise Gatekeeper blocks it on other machines
+
+`gmp` and `mpfr` come from Homebrew and are passed to configure explicitly via
+`--with-gmp` / `--with-mpfr`. This is also why the artifact is not yet portable:
+it references `/opt/homebrew/...` at runtime. The workflow reports this as a
+warning rather than failing.
 
 ### Python scripting
 
@@ -69,14 +99,15 @@ The workflow aborts if any of these conditions is violated:
 - m68k appears in the architecture list (the SvNR's host architecture)
 - the embedded Python interpreter is actually operational
 
-It additionally logs `ldd` and the highest referenced GLIBC symbol version, so
-the 2.31 limit can be traced in the log.
+On Linux it additionally logs `ldd` and the highest referenced GLIBC symbol
+version, so the 2.31 limit can be traced in the log. On macOS the equivalent is
+`otool -L`; there is no glibc counterpart to check.
 
 ## Origin and license
 
-Both artifacts are based on GDB 17.2. The Linux binary is built in CI directly
-from the official sources of the Free Software Foundation; the macOS binary is
-relocated from the build distributed via
+Both artifacts are based on GDB 17.2 and are built in CI directly from the
+official sources of the Free Software Foundation. Only the locally produced
+macOS bundle described below is relocated from the build distributed via
 [Homebrew](https://github.com/Homebrew/homebrew-core/blob/master/Formula/g/gdb.rb).
 The underlying sources are available from the Free Software Foundation:
 
@@ -88,8 +119,9 @@ for the full license text.
 
 ## Local build (macOS ARM64)
 
-There is no CI job for macOS yet, so this artifact is produced with
-`build-gdb.sh` on an Apple Silicon Mac. The script turns an existing Homebrew
+The CI job covers building and signing, but not relocation. For a bundle that
+runs on machines without Homebrew, use `build-gdb.sh` on an Apple Silicon Mac.
+The script turns an existing Homebrew
 GDB installation into a portable bundle: it copies the binary along with its
 dependencies, rewrites all absolute Homebrew paths to `@executable_path`- and
 `@loader_path`-relative references, and re-signs the result ad hoc.
@@ -130,23 +162,25 @@ URL of the current asset and checks its SHA256 sum.
 
 ## Shipped bundle
 
-macOS:
+macOS, produced locally by `build-gdb.sh` (relocated, self-contained):
 
     gdb-macos-arm64/
     ├── bin/gdb              # the actual binary
     ├── lib/                 # rewritten dylibs (readline, mpfr, gmp, ...)
     └── Frameworks/          # Python.framework (for Dolata's m/M scripts)
 
-Linux:
+Linux and macOS from CI (plain install prefix):
 
     gdb-linux-x64-py/
     ├── bin/gdb              # the actual binary (stripped)
     └── share/, include/     # data files from the install prefix
 
-The exact Linux layout is whatever `make install` puts under the prefix; the
+The exact CI layout is whatever `make install` puts under the prefix; the
 *Diagnostics after make* step prints it into the workflow log.
 
-Usage: extract the bundle anywhere and run `bin/gdb`. On macOS no Homebrew, no
-Python and no further prerequisites are needed on the target system. The Linux
-build relies on the target system's `glibc` (≤ 2.31 required at build time)
-and, for the `-py` variant, on `libpython3.8`.
+Usage: extract the bundle anywhere and run `bin/gdb`. The relocated macOS
+bundle needs no Homebrew, no Python and no further prerequisites on the target
+system. The CI builds do have runtime dependencies: on Linux the target
+system's `glibc` (≤ 2.31 required at build time) and, for the `-py` variant,
+`libpython3.8`; on macOS the Homebrew dylibs of the build runner until
+relocation is wired into the workflow.

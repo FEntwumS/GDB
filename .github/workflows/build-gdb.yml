@@ -4,16 +4,19 @@
 # artifact. When a tag is pushed (v*), it is also added to the
 # GitHub release.
 #
-# Current status: linux-x64 only. macOS and Windows will follow as additional jobs.
+# Current status: linux-x64 and macos-arm64. Windows will follow as a third job.
 #
-# The build runs inside an ubuntu:20.04 container rather than on a current
-# runner. The reason is the binding to the host system's libraries: their
-# binary compatibility only holds upwards, so an artifact produced on a
+# Deliberately three explicit jobs instead of a matrix: package management,
+# configure flags and verification differ too much per platform.
+#
+# The Linux build runs inside an ubuntu:20.04 container rather than on a
+# current runner. The reason is the binding to the host system's libraries:
+# their binary compatibility only holds upwards, so an artifact produced on a
 # newer distribution would not start on the VM image used in teaching
 # (Ubuntu 20.04). Conversely, an artifact produced here also runs on newer
 # systems. This affects both glibc and -- with scripting enabled -- libpython.
 
-name: Build GDB for linux-x64
+name: Build GDB
 
 on:
   workflow_dispatch:        # triggerable (Actions-Tab -> Run workflow)
@@ -243,9 +246,255 @@ jobs:
       - name: Package
         run: |
           NAME="gdb-linux-x64${{ steps.variant.outputs.suffix }}"
-          mv gdb-linux-x64 "$NAME"
+          # Without a suffix (variant without Python) source and target are
+          # identical and mv would fail.
+          [ "$NAME" = "gdb-linux-x64" ] || mv gdb-linux-x64 "$NAME"
           tar -czf "${NAME}.tar.gz" "$NAME"
           sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
+          ls -lh "${NAME}.tar.gz"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+          retention-days: 30
+
+      - name: Attach to release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: macos-arm64
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Identify if Python variant
+        id: variant
+        # Unlike the Linux job the interpreter path is not fixed here: it only
+        # becomes known once Homebrew has installed Python, so the configure
+        # flag is assembled later.
+        run: |
+          # The manual-dispatch input takes precedence over the env default.
+          WP="${{ github.event.inputs.with_python }}"
+          if [ -z "$WP" ]; then WP="${WITH_PYTHON}"; fi
+
+          if [ "$WP" = "true" ]; then
+            echo "suffix=-py" >> "$GITHUB_OUTPUT"
+            echo "with_python=true" >> "$GITHUB_OUTPUT"
+            echo "Variant: WITH Python scripting"
+          else
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "with_python=false" >> "$GITHUB_OUTPUT"
+            echo "Variant: WITHOUT Python scripting"
+          fi
+
+      - name: Install Build Dependencies
+        run: |
+          brew install gmp mpfr texinfo
+
+          # texinfo is keg-only on macOS. Without this the build would fall
+          # back to the ancient makeinfo shipped with the system.
+          echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
+
+          echo "--- Environment ---"
+          sw_vers | head -n 2
+          uname -m
+          clang --version | head -n 1
+
+      - name: Install Python (only if scripting is enabled)
+        if: steps.variant.outputs.with_python == 'true'
+        run: |
+          brew install python@3.12
+          PY="$(brew --prefix python@3.12)/bin/python3.12"
+          echo "PYTHON_BIN=${PY}" >> "$GITHUB_ENV"
+          echo "--- Python of the build environment ---"
+          "$PY" --version
+
+      - name: Download Sources
+        run: |
+          curl -fLO "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz"
+          echo "Actual checksum:"
+          shasum -a 256 "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: Verify Checksum
+        run: |
+          if [ -z "${GDB_SHA256}" ]; then
+            echo "::warning::GDB_SHA256 is empty - verification skipped."
+            echo "Copy the checksum printed above into the env block."
+          else
+            echo "${GDB_SHA256}  gdb-${GDB_VERSION}.tar.xz" | shasum -a 256 -c -
+          fi
+
+      - name: Extract
+        run: tar xf "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: configure
+        run: |
+          if [ "${{ steps.variant.outputs.with_python }}" = "true" ]; then
+            PY_FLAG="--with-python=${PYTHON_BIN}"
+          else
+            PY_FLAG="--without-python"
+          fi
+
+          mkdir build && cd build
+
+          # --target=m68k-elf is required, not cosmetic: on arm64 Darwin the
+          # top-level configure puts gdb into noconfigdirs when host and target
+          # are identical, because native debugging is unsupported there. A
+          # differing target keeps gdb in the build plan -- and m68k is the
+          # architecture we need anyway.
+          #
+          # No -static-libstdc++/-static-libgcc here: clang does not support
+          # those flags, unlike the GCC used in the Linux job.
+          ../gdb-${GDB_VERSION}/configure \
+            --prefix="${GITHUB_WORKSPACE}/gdb-macos-arm64" \
+            --target=m68k-elf \
+            --enable-targets=all \
+            --with-expat \
+            --with-system-zlib \
+            --with-gmp="$(brew --prefix gmp)" \
+            --with-mpfr="$(brew --prefix mpfr)" \
+            ${PY_FLAG} \
+            --disable-binutils \
+            --disable-gas \
+            --disable-ld \
+            --disable-gold \
+            --disable-gprof \
+            --disable-sim \
+            --disable-nls \
+            --disable-source-highlight \
+            --disable-werror
+
+      - name: Check that GDB is part of the build plan
+        # Same check as in the Linux job, and here it guards the Apple Silicon
+        # failure mode directly: without --target above, gdb would land in
+        # noconfigdirs and the build target would be missing from the Makefile.
+        run: |
+          if grep -qE '^[[:space:]]*maybe-all-gdb' build/Makefile; then
+            echo "OK: gdb is part of the build plan"
+          else
+            echo "::error::gdb is missing from the generated Makefile."
+            echo "--- Hints from config.log ---"
+            grep -n -iE "noconfigdirs|not supported|skipping" build/config.log \
+              | head -n 20 || true
+            exit 1
+          fi
+
+      - name: make
+        run: |
+          cd build
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Normalize binary name, strip and sign
+        run: |
+          PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
+
+          # A cross build (--target=m68k-elf) installs the binary as
+          # m68k-elf-gdb. The plugin expects bin/gdb, so normalize the name.
+          if [ ! -f "$PREFIX/bin/gdb" ]; then
+            SRC="$(ls "$PREFIX"/bin/*gdb 2>/dev/null | head -n 1)"
+            [ -n "$SRC" ] || { echo "::error::no gdb binary found in $PREFIX/bin"; exit 1; }
+            echo "Renaming $(basename "$SRC") -> gdb"
+            mv "$SRC" "$PREFIX/bin/gdb"
+          fi
+
+          strip "$PREFIX/bin/gdb"
+
+          # strip invalidates an existing signature, so sign afterwards.
+          # "-" = ad-hoc; without a signature Gatekeeper blocks the binary on
+          # other machines.
+          codesign --force --sign - "$PREFIX/bin/gdb"
+          codesign --verify --verbose "$PREFIX/bin/gdb"
+
+      - name: Diagnostics after make
+        # For traceability only: which modules were actually built, and
+        # what ended up in the installation directory?
+        if: always()
+        run: |
+          echo "=== built modules ==="
+          ls -d build/*/ 2>/dev/null || echo "(none)"
+          echo "=== installation directory ==="
+          find "${GITHUB_WORKSPACE}/gdb-macos-arm64" -maxdepth 2 2>/dev/null || true
+
+      - name: Verification
+        run: |
+          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
+
+          echo "--- Version ---"
+          "$GDB" --version | head -n 1
+
+          echo "--- Runtime dependencies ---"
+          # otool -L instead of ldd; the glibc symbol-version check of the
+          # Linux job has no macOS equivalent and is omitted.
+          otool -L "$GDB"
+
+          echo "--- Configuration ---"
+          "$GDB" --configuration
+
+          echo "--- expat ---"
+          "$GDB" --configuration | grep -q -- "--with-expat" \
+            && echo "OK: expat active" \
+            || { echo "::error::expat missing"; exit 1; }
+
+          echo "--- m68k (host architecture of the SVNR) ---"
+          "$GDB" --batch -nx --ex 'set architecture' 2>&1 | grep -q 'm68k' \
+            && echo "OK: m68k in the architecture list" \
+            || { echo "::error::m68k missing - targets=all ineffective?"; exit 1; }
+
+      - name: Portability report (Homebrew references)
+        # Deliberately a warning, not an error: the binary links against the
+        # runner's Homebrew dylibs (gmp, mpfr, and Python when scripting is
+        # on), whose paths do not exist on a clean target machine.
+        # build-gdb.sh performs that relocation; the CI artifact is not
+        # relocated yet.
+        run: |
+          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
+          if otool -L "$GDB" | grep -q "/opt/homebrew"; then
+            echo "::warning::binary still references /opt/homebrew - not portable without relocation"
+            otool -L "$GDB" | grep "/opt/homebrew"
+          else
+            echo "OK: no /opt/homebrew references"
+          fi
+
+      - name: Python functional test
+        if: steps.variant.outputs.with_python == 'true'
+        run: |
+          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
+
+          # Not just "compiled in", but actually operational:
+          # the interpreter must be able to find its standard library.
+          OUT="$("$GDB" -batch -nx -ex "python print('py ok')" 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "py ok" \
+            && echo "OK: Python interpreter operational" \
+            || { echo "::error::Python embedded, but not operational"; exit 1; }
+
+          echo "--- Python dependency ---"
+          # The target system must provide exactly this framework version.
+          otool -L "$GDB" | grep -i python \
+            || echo "(no dynamic Python reference found)"
+
+      - name: Package
+        run: |
+          NAME="gdb-macos-arm64${{ steps.variant.outputs.suffix }}"
+          # Without a suffix (variant without Python) source and target are
+          # identical and mv would fail.
+          [ "$NAME" = "gdb-macos-arm64" ] || mv gdb-macos-arm64 "$NAME"
+          tar --exclude='.DS_Store' -czf "${NAME}.tar.gz" "$NAME"
+          shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
           ls -lh "${NAME}.tar.gz"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
 
