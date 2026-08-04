@@ -16,12 +16,8 @@ SvNR debugger plugin uses.
 | macOS ARM64  | 17.2    | `gdb-macos-arm64-py.tar.gz` | CI (GitHub Actions)     |
 | windows-x64  | 17.2    | `gdb-windows-x64-py.tar.gz` | CI (GitHub Actions)     |
 
-Every archive comes with a `.sha256` file holding its checksum.
-
-Note on macOS: the CI job builds and ad-hoc signs the binary, but does **not**
-relocate it yet — it still links against the runner's Homebrew dylibs. Until
-that is added, `build-gdb.sh` remains the path to a bundle that is portable to
-machines without Homebrew.
+Every archive comes with a `.sha256` file holding its checksum. All three are
+produced entirely in CI; there is no local build step left.
 
 ## Release process
 
@@ -75,9 +71,24 @@ Two consequences of the cross build:
   otherwise Gatekeeper blocks it on other machines
 
 `gmp` and `mpfr` come from Homebrew and are passed to configure explicitly via
-`--with-gmp` / `--with-mpfr`. This is also why the artifact is not yet portable:
-it references `/opt/homebrew/...` at runtime. The workflow reports this as a
-warning rather than failing.
+`--with-gmp` / `--with-mpfr`, so the freshly linked binary references
+`/opt/homebrew/...` at runtime. The *Relocate bundle* step removes that
+dependency:
+
+1. every Homebrew dylib the binary needs is copied into `lib/` — transitively,
+   so libraries pulled in by other libraries are caught as well. The list is
+   discovered from the binary rather than hardcoded, so it follows whatever
+   configure actually linked
+2. for the `-py` variant, `Python.framework` is copied into `Frameworks/`
+3. all absolute Homebrew paths are rewritten to `@loader_path`-relative
+   references via `install_name_tool`, and each dylib's own ID is pointed at
+   `@rpath`
+4. everything is re-signed ad hoc, because `install_name_tool` invalidates
+   signatures — and without a signature Gatekeeper blocks the binary on other
+   machines
+
+The *Portability check* step afterwards is a hard gate: a remaining
+`/opt/homebrew` reference in `bin/gdb` fails the build.
 
 ### Windows: MSYS2 and static linking
 
@@ -114,6 +125,7 @@ The workflow aborts if any of these conditions is violated:
 - expat is active (`--with-expat` in `gdb --configuration`)
 - m68k appears in the architecture list (the SvNR's host architecture)
 - the embedded Python interpreter is actually operational
+- on macOS, `bin/gdb` contains no `/opt/homebrew` reference after relocation
 
 On Linux it additionally logs `ldd` and the highest referenced GLIBC symbol
 version, so the 2.31 limit can be traced in the log. On macOS the equivalent is
@@ -121,11 +133,11 @@ version, so the 2.31 limit can be traced in the log. On macOS the equivalent is
 
 ## Origin and license
 
-Both artifacts are based on GDB 17.2 and are built in CI directly from the
-official sources of the Free Software Foundation. Only the locally produced
-macOS bundle described below is relocated from the build distributed via
-[Homebrew](https://github.com/Homebrew/homebrew-core/blob/master/Formula/g/gdb.rb).
-The underlying sources are available from the Free Software Foundation:
+All three artifacts are based on GDB 17.2 and are built in CI directly from the
+official sources of the Free Software Foundation. On macOS, `gmp`, `mpfr` and
+Python come from [Homebrew](https://brew.sh) and are bundled into the artifact
+by the relocation step. The underlying GDB sources are available from the Free
+Software Foundation:
 
     https://ftp.gnu.org/gnu/gdb/gdb-17.2.tar.xz
 
@@ -133,39 +145,12 @@ GDB is licensed under the **GPLv3**. This redistribution complies with that
 license; the sources are publicly accessible via the link above. See `LICENSE`
 for the full license text.
 
-## Local build (macOS ARM64)
-
-The CI job covers building and signing, but not relocation. For a bundle that
-runs on machines without Homebrew, use `build-gdb.sh` on an Apple Silicon Mac.
-The script turns an existing Homebrew
-GDB installation into a portable bundle: it copies the binary along with its
-dependencies, rewrites all absolute Homebrew paths to `@executable_path`- and
-`@loader_path`-relative references, and re-signs the result ad hoc.
-
-Prerequisites:
-
-- macOS on Apple Silicon (M1/M2/M3/M4)
-- Xcode Command Line Tools
-- Homebrew with `gdb` installed (`brew install gdb`)
-
-Execution:
-
-    ./build-gdb.sh all
-
-The result lands in `~/dev/gdb-macos-arm64/`. Packaging it as a release
-artifact:
-
-    cd ~/dev
-    tar --exclude='.DS_Store' -czf gdb-macos-arm64.tar.gz gdb-macos-arm64
-    shasum -a 256 gdb-macos-arm64.tar.gz > gdb-macos-arm64.tar.gz.sha256
-
 ## Verifying the binary
 
-For Linux these checks run automatically in the workflow (see *Automated
-checks*). For the locally built macOS bundle, the resulting binary should
-satisfy three properties:
+These checks run automatically in the workflow (see *Automated checks*). To
+repeat them by hand on a downloaded macOS bundle:
 
-1. **Portable**: `otool -L bin/gdb` shows only `@executable_path/...`,
+1. **Portable**: `otool -L bin/gdb` shows only `@loader_path/...`,
    `/usr/lib/...` and `/System/...` references. No `/opt/homebrew/...` paths.
 2. **Multiarch**: `bin/gdb --batch -ex 'set architecture' 2>&1 | grep m68k`
    returns a hit (m68k is the SvNR's host architecture).
@@ -178,26 +163,29 @@ URL of the current asset and checks its SHA256 sum.
 
 ## Shipped bundle
 
-macOS, produced locally by `build-gdb.sh` (relocated, self-contained):
+macOS, after the relocation step (self-contained):
 
-    gdb-macos-arm64/
-    ├── bin/gdb              # the actual binary
-    ├── lib/                 # rewritten dylibs (readline, mpfr, gmp, ...)
-    └── Frameworks/          # Python.framework (for Dolata's m/M scripts)
+    gdb-macos-arm64-py/
+    ├── bin/gdb              # the actual binary (stripped, ad-hoc signed)
+    ├── lib/                 # rewritten dylibs (mpfr, gmp, ...)
+    ├── Frameworks/          # Python.framework (for Dolata's m/M scripts)
+    └── share/, include/     # data files from the install prefix
 
-All three CI builds (plain install prefix):
+Linux and Windows (plain install prefix):
 
     gdb-linux-x64-py/
     ├── bin/gdb              # the actual binary (stripped; gdb.exe on Windows)
     └── share/, include/     # data files from the install prefix
 
-The exact CI layout is whatever `make install` puts under the prefix; the
+The exact layout is whatever `make install` puts under the prefix; the
 *Diagnostics after make* step prints it into the workflow log.
 
-Usage: extract the bundle anywhere and run `bin/gdb`. The relocated macOS
-bundle needs no Homebrew, no Python and no further prerequisites on the target
-system. The CI builds do have runtime dependencies: on Linux the target
-system's `glibc` (≤ 2.31 required at build time) and, for the `-py` variant,
-`libpython3.8`; on macOS the Homebrew dylibs of the build runner until
-relocation is wired into the workflow; on Windows nothing beyond the system
-DLLs thanks to `-static`, except the mingw Python DLL in the `-py` variant.
+Usage: extract the bundle anywhere and run `bin/gdb`. Remaining runtime
+dependencies per platform:
+
+- **macOS**: none. Homebrew dylibs and, in the `-py` variant, the Python
+  framework travel inside the bundle
+- **Linux**: the target system's `glibc` (≤ 2.31 required at build time) and,
+  for the `-py` variant, `libpython3.8`
+- **Windows**: nothing beyond the system DLLs thanks to `-static`, except the
+  mingw Python DLL in the `-py` variant

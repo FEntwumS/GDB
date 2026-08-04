@@ -398,7 +398,9 @@ jobs:
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
-      - name: Normalize binary name, strip and sign
+      - name: Normalize binary name and strip
+        # Signing deliberately happens later: the relocation step below runs
+        # install_name_tool, which invalidates any signature.
         run: |
           PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
 
@@ -413,11 +415,109 @@ jobs:
 
           strip "$PREFIX/bin/gdb"
 
-          # strip invalidates an existing signature, so sign afterwards.
+      - name: Relocate bundle (remove Homebrew dependency)
+        # Ports what build-gdb.sh used to do locally into the workflow: pull
+        # every Homebrew dylib into the bundle, rewrite the absolute paths to
+        # @loader_path-relative ones, and re-sign everything. Unlike the old
+        # script the dylib list is not hardcoded but discovered from the
+        # binary, so it follows whatever configure actually linked.
+        run: |
+          PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
+          GDB="$PREFIX/bin/gdb"
+          HB="$(brew --prefix)"
+          mkdir -p "$PREFIX/lib" "$PREFIX/Frameworks"
+
+          # Relative load path from a given file back to <bundle>/<subdir>.
+          # Also correct for the executable: for a Mach-O executable
+          # @loader_path is its own directory.
+          rel_prefix_for() {
+            d="$(dirname "$1")"; up=""
+            while [ "$d" != "$PREFIX" ] && [ "$d" != "/" ]; do
+              up="../$up"; d="$(dirname "$d")"
+            done
+            printf '@loader_path/%s%s' "$up" "$2"
+          }
+
+          # --- 1. Copy in every Homebrew dylib, transitively ---------------
+          # Fixed-point iteration: a freshly copied dylib can pull in more.
+          while :; do
+            NEW=0
+            for f in "$GDB" "$PREFIX"/lib/*.dylib; do
+              [ -f "$f" ] || continue
+              while read -r dep; do
+                case "$dep" in
+                  # Frameworks are handled in step 2. Note that a shell case
+                  # pattern's * also matches "/", so this must come first.
+                  "$HB"/*/Frameworks/*) continue ;;
+                  "$HB"/*)
+                    base="$(basename "$dep")"
+                    if [ ! -f "$PREFIX/lib/$base" ]; then
+                      # -L follows symlinks and copies the real file
+                      cp -L "$dep" "$PREFIX/lib/$base"
+                      chmod u+w "$PREFIX/lib/$base"
+                      echo "copied $base"
+                      NEW=1
+                    fi
+                    ;;
+                esac
+              done < <(otool -L "$f" | tail -n +2 | awk '{print $1}')
+            done
+            if [ "$NEW" -eq 0 ]; then break; fi
+          done
+
+          # --- 2. Copy the Python framework, if the -py variant needs it ---
+          FW_SRC=""
+          while read -r dep; do
+            case "$dep" in
+              "$HB"/*/Frameworks/Python.framework/*)
+                FW_SRC="${dep%%/Frameworks/*}/Frameworks/Python.framework" ;;
+            esac
+          done < <(otool -L "$GDB" | tail -n +2 | awk '{print $1}')
+
+          if [ -n "$FW_SRC" ] && [ ! -d "$PREFIX/Frameworks/Python.framework" ]; then
+            echo "copying $FW_SRC"
+            cp -RL "$FW_SRC" "$PREFIX/Frameworks/"
+          fi
+
+          # --- 3. Rewrite every absolute Homebrew reference ----------------
+          relocate() {
+            t="$1"
+            libp="$(rel_prefix_for "$t" lib)"
+            fwp="$(rel_prefix_for "$t" Frameworks)"
+            case "$t" in
+              # Point the dylib's own ID at @rpath so it works from any path
+              *.dylib) install_name_tool -id "@rpath/$(basename "$t")" "$t" 2>/dev/null || true ;;
+            esac
+            while read -r dep; do
+              case "$dep" in
+                "$HB"/*/Frameworks/Python.framework/*)
+                  sfx="${dep#*/Frameworks/}"
+                  install_name_tool -change "$dep" "$fwp/$sfx" "$t" || true ;;
+                "$HB"/*)
+                  install_name_tool -change "$dep" "$libp/$(basename "$dep")" "$t" || true ;;
+              esac
+            done < <(otool -L "$t" | tail -n +2 | awk '{print $1}')
+          }
+
+          while read -r f; do
+            file "$f" | grep -q "Mach-O" || continue
+            relocate "$f"
+          done < <(find "$PREFIX/lib" "$PREFIX/Frameworks" -type f 2>/dev/null)
+
+          relocate "$GDB"
+          # so that the @rpath IDs of the copied dylibs resolve
+          install_name_tool -add_rpath "@executable_path/../lib" "$GDB" 2>/dev/null || true
+
+          # --- 4. Re-sign: install_name_tool invalidates signatures --------
           # "-" = ad-hoc; without a signature Gatekeeper blocks the binary on
           # other machines.
-          codesign --force --sign - "$PREFIX/bin/gdb"
-          codesign --verify --verbose "$PREFIX/bin/gdb"
+          while read -r f; do
+            file "$f" | grep -q "Mach-O" || continue
+            codesign --force --sign - "$f" 2>/dev/null \
+              || echo "::warning::codesign failed for $f"
+          done < <(find "$PREFIX" -type f)
+
+          codesign --verify --verbose "$GDB"
 
       - name: Diagnostics after make
         # For traceability only: which modules were actually built, and
@@ -454,20 +554,32 @@ jobs:
             && echo "OK: m68k in the architecture list" \
             || { echo "::error::m68k missing - targets=all ineffective?"; exit 1; }
 
-      - name: Portability report (Homebrew references)
-        # Deliberately a warning, not an error: the binary links against the
-        # runner's Homebrew dylibs (gmp, mpfr, and Python when scripting is
-        # on), whose paths do not exist on a clean target machine.
-        # build-gdb.sh performs that relocation; the CI artifact is not
-        # relocated yet.
+      - name: Portability check (no Homebrew references)
+        # Now that the bundle is relocated this is a real gate, not a report:
+        # a leftover absolute path means the artifact will not start on a
+        # machine without Homebrew. Hard failure for the binary, warning for
+        # the bundled libraries.
         run: |
-          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
-          if otool -L "$GDB" | grep -q "/opt/homebrew"; then
-            echo "::warning::binary still references /opt/homebrew - not portable without relocation"
-            otool -L "$GDB" | grep "/opt/homebrew"
-          else
-            echo "OK: no /opt/homebrew references"
+          PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
+          HB="$(brew --prefix)"
+
+          echo "--- otool -L bin/gdb ---"
+          otool -L "$PREFIX/bin/gdb"
+          if otool -L "$PREFIX/bin/gdb" | grep -q "$HB"; then
+            echo "::error::binary still references $HB - relocation incomplete"
+            otool -L "$PREFIX/bin/gdb" | grep "$HB"
+            exit 1
           fi
+          echo "OK: no $HB references in the binary"
+
+          for lib in "$PREFIX"/lib/*.dylib; do
+            [ -f "$lib" ] || continue
+            if otool -L "$lib" | grep -q "$HB"; then
+              echo "::warning::$(basename "$lib") still references $HB"
+              otool -L "$lib" | grep "$HB" | head -n 5
+            fi
+          done
+          echo "OK: bundled dylibs checked"
 
       - name: Python functional test
         if: steps.variant.outputs.with_python == 'true'
@@ -483,7 +595,8 @@ jobs:
             || { echo "::error::Python embedded, but not operational"; exit 1; }
 
           echo "--- Python dependency ---"
-          # The target system must provide exactly this framework version.
+          # After relocation this should point into the bundle's Frameworks
+          # directory, not at Homebrew.
           otool -L "$GDB" | grep -i python \
             || echo "(no dynamic Python reference found)"
 
