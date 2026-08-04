@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# JetBrains IDEs
+.idea/
+
 # Scratch build directories of the script
 svnr-gdb-build/
 gdb-macos-arm64-build/
