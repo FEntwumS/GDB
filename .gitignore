@@ -1,11 +1,11 @@
 # macOS
 .DS_Store
 
-# Build-Baustelle des Skripts
+# Scratch build directories of the script
 svnr-gdb-build/
 gdb-macos-arm64-build/
 
-# Erzeugtes Bundle und Archive gehören in GitHub-Releases, nicht ins Repo
+# Generated bundle and archives belong in GitHub releases, not in the repo
 gdb-macos-arm64/
 gdb-linux-x64/
 gdb-windows-x64/
@@ -13,7 +13,7 @@ gdb-windows-x64/
 *.tar.gz.sha256
 *.zip
 
-# Backups von sed und Editoren
+# Backups from sed and editors
 *.bak
 *.bak2
 *~
