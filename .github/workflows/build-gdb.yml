@@ -4,7 +4,7 @@
 # artifact. When a tag is pushed (v*), it is also added to the
 # GitHub release.
 #
-# Current status: linux-x64 and macos-arm64. Windows will follow as a third job.
+# Covers linux-x64, macos-arm64 and windows-x64.
 #
 # Deliberately three explicit jobs instead of a matrix: package management,
 # configure flags and verification differ too much per platform.
@@ -495,6 +495,248 @@ jobs:
           [ "$NAME" = "gdb-macos-arm64" ] || mv gdb-macos-arm64 "$NAME"
           tar --exclude='.DS_Store' -czf "${NAME}.tar.gz" "$NAME"
           shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
+          ls -lh "${NAME}.tar.gz"
+          echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+          retention-days: 30
+
+      - name: Attach to release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACT_NAME }}.tar.gz
+            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: windows-x64
+    runs-on: windows-latest
+
+    # Every run step goes through the MSYS2 shell. The two `uses` steps below
+    # are unaffected by this; setup-msys2 must therefore run before the first
+    # run step.
+    defaults:
+      run:
+        shell: 'msys2 {0}'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          # MSYS packages (build tooling) plus the UCRT64 toolchain and
+          # libraries. Python is installed later, only for the -py variant.
+          install: >-
+            make
+            texinfo
+            tar
+            xz
+            curl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gmp
+            mingw-w64-ucrt-x86_64-mpfr
+            mingw-w64-ucrt-x86_64-expat
+            mingw-w64-ucrt-x86_64-ncurses
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Identify if Python variant
+        id: variant
+        run: |
+          # The manual-dispatch input takes precedence over the env default.
+          WP="${{ github.event.inputs.with_python }}"
+          if [ -z "$WP" ]; then WP="${WITH_PYTHON}"; fi
+
+          if [ "$WP" = "true" ]; then
+            echo "suffix=-py" >> "$GITHUB_OUTPUT"
+            echo "with_python=true" >> "$GITHUB_OUTPUT"
+            echo "Variant: WITH Python scripting"
+          else
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "with_python=false" >> "$GITHUB_OUTPUT"
+            echo "Variant: WITHOUT Python scripting"
+          fi
+
+          echo "--- Environment ---"
+          echo "MSYSTEM=${MSYSTEM}"
+          gcc --version | head -n 1
+
+      - name: Install Python (only if scripting is enabled)
+        if: steps.variant.outputs.with_python == 'true'
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-python
+          echo "--- Python of the build environment ---"
+          /ucrt64/bin/python3 --version
+
+      - name: Download Sources
+        run: |
+          curl -fLO "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz"
+          echo "Actual checksum:"
+          sha256sum "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: Verify Checksum
+        run: |
+          if [ -z "${GDB_SHA256}" ]; then
+            echo "::warning::GDB_SHA256 is empty - verification skipped."
+            echo "Copy the checksum printed above into the env block."
+          else
+            echo "${GDB_SHA256}  gdb-${GDB_VERSION}.tar.xz" | sha256sum -c -
+          fi
+
+      - name: Extract
+        run: tar xf "gdb-${GDB_VERSION}.tar.xz"
+
+      - name: configure
+        run: |
+          # GITHUB_WORKSPACE is a Windows path (D:\a\...); configure and make
+          # need the POSIX form.
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+
+          if [ "${{ steps.variant.outputs.with_python }}" = "true" ]; then
+            PY_FLAG="--with-python=/ucrt64/bin/python3"
+          else
+            PY_FLAG="--without-python"
+          fi
+
+          mkdir build && cd build
+
+          # Unlike arm64 Darwin, native debugging is supported on x86_64
+          # Windows, so no --target detour is needed here; the m68k support
+          # comes from --enable-targets=all.
+          #
+          # -static avoids runtime dependencies on the MSYS2/mingw DLLs
+          # (libstdc++-6, libgcc_s_seh-1, libwinpthread-1), which would not be
+          # present on a target machine.
+          ../gdb-${GDB_VERSION}/configure \
+            --prefix="${WORK}/gdb-windows-x64" \
+            --enable-targets=all \
+            --with-expat \
+            --with-system-zlib \
+            ${PY_FLAG} \
+            --disable-binutils \
+            --disable-gas \
+            --disable-ld \
+            --disable-gold \
+            --disable-gprof \
+            --disable-sim \
+            --disable-nls \
+            --disable-source-highlight \
+            --disable-werror \
+            LDFLAGS="-static"
+
+      - name: Check that GDB is part of the build plan
+        # Same guard as in the other jobs: if gdb ends up in noconfigdirs, the
+        # build target is missing from the generated Makefile.
+        run: |
+          if grep -qE '^[[:space:]]*maybe-all-gdb' build/Makefile; then
+            echo "OK: gdb is part of the build plan"
+          else
+            echo "::error::gdb is missing from the generated Makefile."
+            echo "--- Hints from config.log ---"
+            grep -n -iE "noconfigdirs|not supported|skipping" build/config.log \
+              | head -n 20 || true
+            exit 1
+          fi
+
+      - name: make
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          cd build
+          make -j"$(nproc)"
+          make install
+          strip "${WORK}/gdb-windows-x64/bin/gdb.exe"
+
+      - name: Diagnostics after make
+        # For traceability only: which modules were actually built, and
+        # what ended up in the installation directory?
+        if: always()
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          echo "=== built modules ==="
+          ls -d build/*/ 2>/dev/null || echo "(none)"
+          echo "=== installation directory ==="
+          find "${WORK}/gdb-windows-x64" -maxdepth 2 2>/dev/null || true
+
+      - name: Verification
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
+
+          echo "--- Version ---"
+          "$GDB" --version | head -n 1
+
+          echo "--- Runtime dependencies (imported DLLs) ---"
+          # objdump instead of ldd: ldd exists under MSYS2 but reports the
+          # MSYS view, not the DLLs the PE image actually imports.
+          # No glibc check here -- that is Linux-specific.
+          objdump -p "$GDB" | grep -i "DLL Name" | sort -u
+
+          echo "--- Configuration ---"
+          "$GDB" --configuration
+
+          echo "--- expat ---"
+          "$GDB" --configuration | grep -q -- "--with-expat" \
+            && echo "OK: expat active" \
+            || { echo "::error::expat missing"; exit 1; }
+
+          echo "--- m68k (host architecture of the SVNR) ---"
+          "$GDB" --batch -nx --ex 'set architecture' 2>&1 | grep -q 'm68k' \
+            && echo "OK: m68k in the architecture list" \
+            || { echo "::error::m68k missing - targets=all ineffective?"; exit 1; }
+
+      - name: Portability report (MSYS2 runtime DLLs)
+        # Deliberately a warning, not an error: LDFLAGS="-static" should have
+        # removed these, but the -py variant necessarily keeps a dynamic
+        # dependency on the mingw Python DLL.
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
+
+          DLLS="$(objdump -p "$GDB" | grep -i "DLL Name" | sort -u)"
+          HITS="$(echo "$DLLS" | grep -iE 'libstdc\+\+|libgcc_s|libwinpthread|msys-2\.0' || true)"
+          if [ -n "$HITS" ]; then
+            echo "::warning::binary depends on MSYS2/mingw runtime DLLs - -static did not take full effect"
+            echo "$HITS"
+          else
+            echo "OK: no MSYS2/mingw runtime DLLs referenced"
+          fi
+
+          echo "$DLLS" | grep -i python \
+            || echo "(no Python DLL reference found)"
+
+      - name: Python functional test
+        if: steps.variant.outputs.with_python == 'true'
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
+
+          # Not just "compiled in", but actually operational:
+          # the interpreter must be able to find its standard library.
+          OUT="$("$GDB" -batch -nx -ex "python print('py ok')" 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "py ok" \
+            && echo "OK: Python interpreter operational" \
+            || { echo "::error::Python embedded, but not operational"; exit 1; }
+
+      - name: Package
+        run: |
+          NAME="gdb-windows-x64${{ steps.variant.outputs.suffix }}"
+          # Without a suffix (variant without Python) source and target are
+          # identical and mv would fail.
+          [ "$NAME" = "gdb-windows-x64" ] || mv gdb-windows-x64 "$NAME"
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
           ls -lh "${NAME}.tar.gz"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
 

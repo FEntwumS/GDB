@@ -14,9 +14,9 @@ SvNR debugger plugin uses.
 |--------------|---------|-----------------------------|-------------------------|
 | linux-x64    | 17.2    | `gdb-linux-x64-py.tar.gz`   | CI (GitHub Actions)     |
 | macOS ARM64  | 17.2    | `gdb-macos-arm64-py.tar.gz` | CI (GitHub Actions)     |
+| windows-x64  | 17.2    | `gdb-windows-x64-py.tar.gz` | CI (GitHub Actions)     |
 
-Every archive comes with a `.sha256` file holding its checksum. Windows x64
-will be added as a further CI job in the same fashion.
+Every archive comes with a `.sha256` file holding its checksum.
 
 Note on macOS: the CI job builds and ad-hoc signs the binary, but does **not**
 relocate it yet — it still links against the runner's Homebrew dylibs. Until
@@ -27,9 +27,9 @@ machines without Homebrew.
 
 Binaries are no longer produced on a developer machine but in CI. The
 authoritative definition is the workflow `.github/workflows/build-gdb.yml`,
-which holds one explicit job per platform (`build-linux`, `build-macos`) —
-deliberately no matrix, since package management, configure flags and
-verification differ too much per platform.
+which holds one explicit job per platform (`build-linux`, `build-macos`,
+`build-windows`) — deliberately no matrix, since package management, configure
+flags and verification differ too much per platform.
 
 **Triggering a release** — a tag matching `v*` starts the workflow:
 
@@ -78,6 +78,22 @@ Two consequences of the cross build:
 `--with-gmp` / `--with-mpfr`. This is also why the artifact is not yet portable:
 it references `/opt/homebrew/...` at runtime. The workflow reports this as a
 warning rather than failing.
+
+### Windows: MSYS2 and static linking
+
+The job runs on `windows-latest` and builds in the MSYS2 UCRT64 environment
+(`msys2/setup-msys2@v2`); all run steps go through `shell: 'msys2 {0}'`, set
+once via the job's `defaults`. Dependencies come from pacman
+(`mingw-w64-ucrt-x86_64-{gcc,gmp,mpfr,expat,ncurses,zlib}` plus `make` and
+`texinfo`).
+
+Native debugging is supported on x86_64 Windows, so unlike macOS no `--target`
+detour is needed — m68k comes from `--enable-targets=all`. The binary is
+`bin/gdb.exe`, and `LDFLAGS="-static"` keeps the mingw runtime DLLs
+(`libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`) out of the image.
+Dependencies are inspected with `objdump -p | grep "DLL Name"` rather than
+`ldd`, which under MSYS2 reports the MSYS view instead of the PE imports. No
+code signing and no glibc check apply here.
 
 ### Python scripting
 
@@ -169,10 +185,10 @@ macOS, produced locally by `build-gdb.sh` (relocated, self-contained):
     ├── lib/                 # rewritten dylibs (readline, mpfr, gmp, ...)
     └── Frameworks/          # Python.framework (for Dolata's m/M scripts)
 
-Linux and macOS from CI (plain install prefix):
+All three CI builds (plain install prefix):
 
     gdb-linux-x64-py/
-    ├── bin/gdb              # the actual binary (stripped)
+    ├── bin/gdb              # the actual binary (stripped; gdb.exe on Windows)
     └── share/, include/     # data files from the install prefix
 
 The exact CI layout is whatever `make install` puts under the prefix; the
@@ -183,4 +199,5 @@ bundle needs no Homebrew, no Python and no further prerequisites on the target
 system. The CI builds do have runtime dependencies: on Linux the target
 system's `glibc` (≤ 2.31 required at build time) and, for the `-py` variant,
 `libpython3.8`; on macOS the Homebrew dylibs of the build runner until
-relocation is wired into the workflow.
+relocation is wired into the workflow; on Windows nothing beyond the system
+DLLs thanks to `-static`, except the mingw Python DLL in the `-py` variant.
