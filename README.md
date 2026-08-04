@@ -36,10 +36,16 @@ The workflow builds GDB from the official GNU sources, verifies the result,
 and automatically attaches the archive and its checksum to the GitHub release
 for that tag.
 
-**Trial run without a release** — Actions tab → *Build GDB* →
-*Run workflow*. The `with_python` switch there also allows building the
-variant without Python scripting. The result is kept for 30 days as a
-workflow artifact, without creating a release.
+**Trial run without a release** — Actions tab → *Build GDB* → *Run workflow*.
+The form offers four checkboxes, all ticked by default:
+
+- `with_python` — build the variant without Python scripting when unticked
+- `build_linux` / `build_macos` / `build_windows` — which platforms to build,
+  so a trial run can be limited to the job you are working on
+
+The platform checkboxes only affect a manual start. A tag push always builds
+all three. The result is kept for 30 days as a workflow artifact, without
+creating a release.
 
 The GDB version is maintained in the workflow's `env` block (`GDB_VERSION`,
 `GDB_SHA256`).

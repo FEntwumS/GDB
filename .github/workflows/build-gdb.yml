@@ -25,6 +25,22 @@ on:
         description: 'Enable Python-Scripting'
         type: boolean
         default: true
+      # Platform switches, so a manual run can be limited to the job you are
+      # actually working on instead of burning three runners every time.
+      # These only apply to a manual start -- a tag push always builds all
+      # three, see the if: conditions on the jobs.
+      build_linux:
+        description: 'Build linux-x64'
+        type: boolean
+        default: true
+      build_macos:
+        description: 'Build macos-arm64'
+        type: boolean
+        default: true
+      build_windows:
+        description: 'Build windows-x64'
+        type: boolean
+        default: true
   push:
     tags:
       - 'v*'
@@ -57,6 +73,9 @@ env:
 jobs:
   build-linux:
     name: linux-x64
+    # On a tag push or pull request the `inputs` context is empty, so the
+    # first clause keeps the job running; the checkbox only gates manual runs.
+    if: github.event_name != 'workflow_dispatch' || inputs.build_linux
     runs-on: ubuntu-latest
     container:
       image: ubuntu:20.04
@@ -274,6 +293,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: macos-arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.build_macos
     runs-on: macos-14
 
     steps:
@@ -631,6 +651,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-windows:
     name: windows-x64
+    if: github.event_name != 'workflow_dispatch' || inputs.build_windows
     runs-on: windows-latest
 
     # Every run step goes through the MSYS2 shell. The two `uses` steps below
