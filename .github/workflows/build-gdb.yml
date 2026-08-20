@@ -824,10 +824,14 @@ jobs:
             && echo "OK: expat active" \
             || { echo "::error::expat missing"; exit 1; }
 
-          echo "--- m68k (host architecture of the SVNR) ---"
-          "$GDB" --batch -nx --ex 'set architecture' 2>&1 | grep -q 'm68k' \
-            && echo "OK: m68k in the architecture list" \
-            || { echo "::error::m68k missing - targets=all ineffective?"; exit 1; }
+          echo "--- m68k (SVNR target architecture) ---"
+          ARCH="$("$GDB" --batch -nx \
+            -ex 'set architecture m68k' \
+            -ex 'show architecture' 2>&1)"
+          echo "$ARCH"
+          echo "$ARCH" | grep -q 'm68k' \
+             && echo "OK: m68k architecture available" \
+             || { echo "::error::m68k architecture unavailable"; exit 1; }
 
       - name: Portability report (MSYS2 runtime DLLs)
         # Deliberately a warning, not an error: LDFLAGS="-static" should have
