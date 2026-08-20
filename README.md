@@ -14,13 +14,15 @@ SvNR debugger plugin uses.
 |----------------|---------|--------------------------------|---------------------|
 | linux-x86_64   | 17.2    | `gdb-linux-x86_64-py.tar.gz`   | CI (GitHub Actions) |
 | macOS ARM64    | 17.2    | `gdb-macos-arm64-py.tar.gz`    | CI (GitHub Actions) |
-| windows-x86_64 | 17.2    | `gdb-windows-x86_64.tar.gz`    | CI (GitHub Actions) |
+| windows-x86_64 | 17.2    | `gdb-windows-x86_64.zip`       | CI (GitHub Actions) |
 
 Every archive holds the binary at the same relative path: `bin/gdb-multiarch-py`
 with Python scripting, `bin/gdb-multiarch.exe` on Windows. The plugin therefore
 needs no per-platform special case.
 
-Every archive comes with a `.sha256` file holding its checksum. All three are
+Every archive comes with a `.sha256` file holding its checksum. Windows ships
+as `.zip` -- double-click extraction without an extra tool -- the other two
+as `.tar.gz`. All three are
 produced entirely in CI; there is no local build step left.
 
 ## Release process

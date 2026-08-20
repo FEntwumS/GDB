@@ -691,6 +691,7 @@ jobs:
             texinfo
             tar
             xz
+            zip
             curl
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-gmp
@@ -843,13 +844,17 @@ jobs:
           fi
 
       - name: Package
+        # .zip instead of .tar.gz on Windows: the target audience extracts by
+        # hand there, and double-click extraction only works for .zip without
+        # an extra tool. Flat archive, same as the other platforms: it
+        # unpacks straight into bin/, share/, ... with no top-level folder.
         run: |
           NAME="gdb-windows-x86_64"
-          # Flat archive: bin/gdb-multiarch.exe is the same relative path in
-          # every platform archive, so the plugin needs no special case.
-          tar -czf "${NAME}.tar.gz" -C gdb-windows-x86_64 .
-          sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
-          ls -lh "${NAME}.tar.gz"
+          cd gdb-windows-x86_64
+          zip -rq "../${NAME}.zip" .
+          cd ..
+          sha256sum "${NAME}.zip" | tee "${NAME}.zip.sha256"
+          ls -lh "${NAME}.zip"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -857,8 +862,8 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: |
-            ${{ env.ARTIFACT_NAME }}.tar.gz
-            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+            ${{ env.ARTIFACT_NAME }}.zip
+            ${{ env.ARTIFACT_NAME }}.zip.sha256
           retention-days: 30
 
       - name: Attach to release (tag push only)
@@ -866,5 +871,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.ARTIFACT_NAME }}.tar.gz
-            ${{ env.ARTIFACT_NAME }}.tar.gz.sha256
+            ${{ env.ARTIFACT_NAME }}.zip
+            ${{ env.ARTIFACT_NAME }}.zip.sha256
