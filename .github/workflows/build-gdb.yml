@@ -4,7 +4,7 @@
 # artifact. When a tag is pushed (v*), it is also added to the
 # GitHub release.
 #
-# Covers linux-x64, macos-arm64 and windows-x64.
+# Covers linux-x86_64, macos-arm64 and windows-x86_64.
 #
 # Deliberately three explicit jobs instead of a matrix: package management,
 # configure flags and verification differ too much per platform.
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:        # triggerable (Actions-Tab -> Run workflow)
     inputs:
       with_python:
-        description: 'Enable Python-Scripting'
+        description: 'Enable Python scripting (linux and macos only)'
         type: boolean
         default: true
       # Platform switches, so a manual run can be limited to the job you are
@@ -30,7 +30,7 @@ on:
       # These only apply to a manual start -- a tag push always builds all
       # three, see the if: conditions on the jobs.
       build_linux:
-        description: 'Build linux-x64'
+        description: 'Build linux-x86_64'
         type: boolean
         default: true
       build_macos:
@@ -38,7 +38,7 @@ on:
         type: boolean
         default: true
       build_windows:
-        description: 'Build windows-x64'
+        description: 'Build windows-x86_64'
         type: boolean
         default: true
   push:
@@ -68,11 +68,15 @@ env:
   #            as long as the data is displayed in the user interface.
   #
   # If you start the workflow manually, the value entered above will be overwritten.
+  #
+  # Applies to the linux and macos jobs only. Windows is built without Python
+  # on purpose: the mingw interpreter cannot be linked statically, so the -py
+  # variant would drag a libpython DLL along and defeat LDFLAGS="-static".
   WITH_PYTHON: 'true'
 
 jobs:
   build-linux:
-    name: linux-x64
+    name: linux-x86_64
     # On a tag push or pull request the `inputs` context is empty, so the
     # first clause keeps the job running; the checkbox only gates manual runs.
     if: github.event_name != 'workflow_dispatch' || inputs.build_linux
@@ -127,11 +131,13 @@ jobs:
           if [ "$WP" = "true" ]; then
             echo "python_flag=--with-python=/usr/bin/python3" >> "$GITHUB_OUTPUT"
             echo "suffix=-py" >> "$GITHUB_OUTPUT"
+            echo "binary=gdb-multiarch-py" >> "$GITHUB_OUTPUT"
             echo "with_python=true" >> "$GITHUB_OUTPUT"
             echo "Variant: WITH Python scripting"
           else
             echo "python_flag=--without-python" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "binary=gdb-multiarch" >> "$GITHUB_OUTPUT"
             echo "with_python=false" >> "$GITHUB_OUTPUT"
             echo "Variant: WITHOUT Python scripting"
           fi
@@ -167,7 +173,7 @@ jobs:
         run: |
           mkdir build && cd build
           ../gdb-${GDB_VERSION}/configure \
-            --prefix="${GITHUB_WORKSPACE}/gdb-linux-x64" \
+            --prefix="${GITHUB_WORKSPACE}/gdb-linux-x86_64" \
             --enable-targets=all \
             --with-expat \
             --with-system-zlib \
@@ -204,7 +210,12 @@ jobs:
           cd build
           make -j"$(nproc)"
           make install
-          strip "${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+          strip "${GITHUB_WORKSPACE}/gdb-linux-x86_64/bin/gdb"
+
+          # One name on every platform, so the plugin can point at bin/<name>
+          # without knowing which archive it unpacked.
+          mv "${GITHUB_WORKSPACE}/gdb-linux-x86_64/bin/gdb" \
+             "${GITHUB_WORKSPACE}/gdb-linux-x86_64/bin/${{ steps.variant.outputs.binary }}"
 
       - name: Diagnostics after make
         # For traceability only: which modules were actually built, and
@@ -214,11 +225,11 @@ jobs:
           echo "=== built modules ==="
           ls -d build/*/ 2>/dev/null || echo "(none)"
           echo "=== installation directory ==="
-          find "${GITHUB_WORKSPACE}/gdb-linux-x64" -maxdepth 2 2>/dev/null || true
+          find "${GITHUB_WORKSPACE}/gdb-linux-x86_64" -maxdepth 2 2>/dev/null || true
 
       - name: Verification
         run: |
-          GDB="${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+          GDB="${GITHUB_WORKSPACE}/gdb-linux-x86_64/bin/${{ steps.variant.outputs.binary }}"
 
           echo "--- Version ---"
           "$GDB" --version | head -n 1
@@ -246,7 +257,7 @@ jobs:
       - name: Python functional test
         if: steps.variant.outputs.with_python == 'true'
         run: |
-          GDB="${GITHUB_WORKSPACE}/gdb-linux-x64/bin/gdb"
+          GDB="${GITHUB_WORKSPACE}/gdb-linux-x86_64/bin/${{ steps.variant.outputs.binary }}"
 
           # Not just "compiled in", but actually operational:
           # the interpreter must be able to find its standard library.
@@ -264,11 +275,10 @@ jobs:
 
       - name: Package
         run: |
-          NAME="gdb-linux-x64${{ steps.variant.outputs.suffix }}"
-          # Without a suffix (variant without Python) source and target are
-          # identical and mv would fail.
-          [ "$NAME" = "gdb-linux-x64" ] || mv gdb-linux-x64 "$NAME"
-          tar -czf "${NAME}.tar.gz" "$NAME"
+          NAME="gdb-linux-x86_64${{ steps.variant.outputs.suffix }}"
+          # Flat archive: bin/<name> is the same relative path in every
+          # platform archive, so the plugin needs no special case.
+          tar -czf "${NAME}.tar.gz" -C gdb-linux-x86_64 .
           sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
           ls -lh "${NAME}.tar.gz"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
@@ -312,10 +322,12 @@ jobs:
 
           if [ "$WP" = "true" ]; then
             echo "suffix=-py" >> "$GITHUB_OUTPUT"
+            echo "binary=gdb-multiarch-py" >> "$GITHUB_OUTPUT"
             echo "with_python=true" >> "$GITHUB_OUTPUT"
             echo "Variant: WITH Python scripting"
           else
             echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "binary=gdb-multiarch" >> "$GITHUB_OUTPUT"
             echo "with_python=false" >> "$GITHUB_OUTPUT"
             echo "Variant: WITHOUT Python scripting"
           fi
@@ -423,17 +435,19 @@ jobs:
         # install_name_tool, which invalidates any signature.
         run: |
           PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
+          BIN="${{ steps.variant.outputs.binary }}"
 
           # A cross build (--target=m68k-elf) installs the binary as
-          # m68k-elf-gdb. The plugin expects bin/gdb, so normalize the name.
-          if [ ! -f "$PREFIX/bin/gdb" ]; then
+          # m68k-elf-gdb. Every platform ships it under the same name, so the
+          # normalization happens here.
+          if [ ! -f "$PREFIX/bin/$BIN" ]; then
             SRC="$(ls "$PREFIX"/bin/*gdb 2>/dev/null | head -n 1)"
             [ -n "$SRC" ] || { echo "::error::no gdb binary found in $PREFIX/bin"; exit 1; }
-            echo "Renaming $(basename "$SRC") -> gdb"
-            mv "$SRC" "$PREFIX/bin/gdb"
+            echo "Renaming $(basename "$SRC") -> $BIN"
+            mv "$SRC" "$PREFIX/bin/$BIN"
           fi
 
-          strip "$PREFIX/bin/gdb"
+          strip "$PREFIX/bin/$BIN"
 
       - name: Relocate bundle (remove Homebrew dependency)
         # Ports what build-gdb.sh used to do locally into the workflow: pull
@@ -443,7 +457,7 @@ jobs:
         # binary, so it follows whatever configure actually linked.
         run: |
           PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
-          GDB="$PREFIX/bin/gdb"
+          GDB="$PREFIX/bin/${{ steps.variant.outputs.binary }}"
           HB="$(brew --prefix)"
           mkdir -p "$PREFIX/lib" "$PREFIX/Frameworks"
 
@@ -551,7 +565,7 @@ jobs:
 
       - name: Verification
         run: |
-          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
+          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/${{ steps.variant.outputs.binary }}"
 
           echo "--- Version ---"
           "$GDB" --version | head -n 1
@@ -581,13 +595,14 @@ jobs:
         # the bundled libraries.
         run: |
           PREFIX="${GITHUB_WORKSPACE}/gdb-macos-arm64"
+          BIN="${{ steps.variant.outputs.binary }}"
           HB="$(brew --prefix)"
 
-          echo "--- otool -L bin/gdb ---"
-          otool -L "$PREFIX/bin/gdb"
-          if otool -L "$PREFIX/bin/gdb" | grep -q "$HB"; then
+          echo "--- otool -L bin/$BIN ---"
+          otool -L "$PREFIX/bin/$BIN"
+          if otool -L "$PREFIX/bin/$BIN" | grep -q "$HB"; then
             echo "::error::binary still references $HB - relocation incomplete"
-            otool -L "$PREFIX/bin/gdb" | grep "$HB"
+            otool -L "$PREFIX/bin/$BIN" | grep "$HB"
             exit 1
           fi
           echo "OK: no $HB references in the binary"
@@ -604,7 +619,7 @@ jobs:
       - name: Python functional test
         if: steps.variant.outputs.with_python == 'true'
         run: |
-          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/gdb"
+          GDB="${GITHUB_WORKSPACE}/gdb-macos-arm64/bin/${{ steps.variant.outputs.binary }}"
 
           # Not just "compiled in", but actually operational:
           # the interpreter must be able to find its standard library.
@@ -623,10 +638,9 @@ jobs:
       - name: Package
         run: |
           NAME="gdb-macos-arm64${{ steps.variant.outputs.suffix }}"
-          # Without a suffix (variant without Python) source and target are
-          # identical and mv would fail.
-          [ "$NAME" = "gdb-macos-arm64" ] || mv gdb-macos-arm64 "$NAME"
-          tar --exclude='.DS_Store' -czf "${NAME}.tar.gz" "$NAME"
+          # Flat archive: bin/<name> is the same relative path in every
+          # platform archive, so the plugin needs no special case.
+          tar --exclude='.DS_Store' -czf "${NAME}.tar.gz" -C gdb-macos-arm64 .
           shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
           ls -lh "${NAME}.tar.gz"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"
@@ -650,7 +664,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   build-windows:
-    name: windows-x64
+    name: windows-x86_64
     if: github.event_name != 'workflow_dispatch' || inputs.build_windows
     runs-on: windows-latest
 
@@ -671,7 +685,7 @@ jobs:
           msystem: UCRT64
           update: true
           # MSYS packages (build tooling) plus the UCRT64 toolchain and
-          # libraries. Python is installed later, only for the -py variant.
+          # libraries. No Python here -- this job never builds the -py variant.
           install: >-
             make
             texinfo
@@ -685,33 +699,11 @@ jobs:
             mingw-w64-ucrt-x86_64-ncurses
             mingw-w64-ucrt-x86_64-zlib
 
-      - name: Identify if Python variant
-        id: variant
+      - name: Environment
         run: |
-          # The manual-dispatch input takes precedence over the env default.
-          WP="${{ github.event.inputs.with_python }}"
-          if [ -z "$WP" ]; then WP="${WITH_PYTHON}"; fi
-
-          if [ "$WP" = "true" ]; then
-            echo "suffix=-py" >> "$GITHUB_OUTPUT"
-            echo "with_python=true" >> "$GITHUB_OUTPUT"
-            echo "Variant: WITH Python scripting"
-          else
-            echo "suffix=" >> "$GITHUB_OUTPUT"
-            echo "with_python=false" >> "$GITHUB_OUTPUT"
-            echo "Variant: WITHOUT Python scripting"
-          fi
-
           echo "--- Environment ---"
           echo "MSYSTEM=${MSYSTEM}"
           gcc --version | head -n 1
-
-      - name: Install Python (only if scripting is enabled)
-        if: steps.variant.outputs.with_python == 'true'
-        run: |
-          pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-python
-          echo "--- Python of the build environment ---"
-          /ucrt64/bin/python3 --version
 
       - name: Download Sources
         run: |
@@ -737,12 +729,6 @@ jobs:
           # need the POSIX form.
           WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
 
-          if [ "${{ steps.variant.outputs.with_python }}" = "true" ]; then
-            PY_FLAG="--with-python=/ucrt64/bin/python3"
-          else
-            PY_FLAG="--without-python"
-          fi
-
           mkdir build && cd build
 
           # Unlike arm64 Darwin, native debugging is supported on x86_64
@@ -753,11 +739,11 @@ jobs:
           # (libstdc++-6, libgcc_s_seh-1, libwinpthread-1), which would not be
           # present on a target machine.
           ../gdb-${GDB_VERSION}/configure \
-            --prefix="${WORK}/gdb-windows-x64" \
+            --prefix="${WORK}/gdb-windows-x86_64" \
             --enable-targets=all \
             --with-expat \
             --with-system-zlib \
-            ${PY_FLAG} \
+            --without-python \
             --disable-binutils \
             --disable-gas \
             --disable-ld \
@@ -789,7 +775,12 @@ jobs:
           cd build
           make -j"$(nproc)"
           make install
-          strip "${WORK}/gdb-windows-x64/bin/gdb.exe"
+          strip "${WORK}/gdb-windows-x86_64/bin/gdb.exe"
+
+          # One name on every platform, so the plugin can point at
+          # bin/gdb-multiarch.exe without knowing which archive it unpacked.
+          mv "${WORK}/gdb-windows-x86_64/bin/gdb.exe" \
+             "${WORK}/gdb-windows-x86_64/bin/gdb-multiarch.exe"
 
       - name: Diagnostics after make
         # For traceability only: which modules were actually built, and
@@ -800,12 +791,12 @@ jobs:
           echo "=== built modules ==="
           ls -d build/*/ 2>/dev/null || echo "(none)"
           echo "=== installation directory ==="
-          find "${WORK}/gdb-windows-x64" -maxdepth 2 2>/dev/null || true
+          find "${WORK}/gdb-windows-x86_64" -maxdepth 2 2>/dev/null || true
 
       - name: Verification
         run: |
           WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
-          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
+          GDB="${WORK}/gdb-windows-x86_64/bin/gdb-multiarch.exe"
 
           echo "--- Version ---"
           "$GDB" --version | head -n 1
@@ -835,11 +826,12 @@ jobs:
 
       - name: Portability report (MSYS2 runtime DLLs)
         # Deliberately a warning, not an error: LDFLAGS="-static" should have
-        # removed these, but the -py variant necessarily keeps a dynamic
-        # dependency on the mingw Python DLL.
+        # removed these, and without Python in this job there is no remaining
+        # reason for a dynamic mingw dependency -- but a warning is easier to
+        # read in the log than a failed run.
         run: |
           WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
-          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
+          GDB="${WORK}/gdb-windows-x86_64/bin/gdb-multiarch.exe"
 
           DLLS="$(objdump -p "$GDB" | grep -i "DLL Name" | sort -u)"
           HITS="$(echo "$DLLS" | grep -iE 'libstdc\+\+|libgcc_s|libwinpthread|msys-2\.0' || true)"
@@ -850,30 +842,12 @@ jobs:
             echo "OK: no MSYS2/mingw runtime DLLs referenced"
           fi
 
-          echo "$DLLS" | grep -i python \
-            || echo "(no Python DLL reference found)"
-
-      - name: Python functional test
-        if: steps.variant.outputs.with_python == 'true'
-        run: |
-          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
-          GDB="${WORK}/gdb-windows-x64/bin/gdb.exe"
-
-          # Not just "compiled in", but actually operational:
-          # the interpreter must be able to find its standard library.
-          OUT="$("$GDB" -batch -nx -ex "python print('py ok')" 2>&1)"
-          echo "$OUT"
-          echo "$OUT" | grep -q "py ok" \
-            && echo "OK: Python interpreter operational" \
-            || { echo "::error::Python embedded, but not operational"; exit 1; }
-
       - name: Package
         run: |
-          NAME="gdb-windows-x64${{ steps.variant.outputs.suffix }}"
-          # Without a suffix (variant without Python) source and target are
-          # identical and mv would fail.
-          [ "$NAME" = "gdb-windows-x64" ] || mv gdb-windows-x64 "$NAME"
-          tar -czf "${NAME}.tar.gz" "$NAME"
+          NAME="gdb-windows-x86_64"
+          # Flat archive: bin/gdb-multiarch.exe is the same relative path in
+          # every platform archive, so the plugin needs no special case.
+          tar -czf "${NAME}.tar.gz" -C gdb-windows-x86_64 .
           sha256sum "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256"
           ls -lh "${NAME}.tar.gz"
           echo "ARTIFACT_NAME=${NAME}" >> "$GITHUB_ENV"

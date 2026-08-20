@@ -10,11 +10,15 @@ SvNR debugger plugin uses.
 
 ## Current artifacts
 
-| Platform     | Version | Release asset               | Produced by             |
-|--------------|---------|-----------------------------|-------------------------|
-| linux-x64    | 17.2    | `gdb-linux-x64-py.tar.gz`   | CI (GitHub Actions)     |
-| macOS ARM64  | 17.2    | `gdb-macos-arm64-py.tar.gz` | CI (GitHub Actions)     |
-| windows-x64  | 17.2    | `gdb-windows-x64-py.tar.gz` | CI (GitHub Actions)     |
+| Platform       | Version | Release asset                  | Produced by         |
+|----------------|---------|--------------------------------|---------------------|
+| linux-x86_64   | 17.2    | `gdb-linux-x86_64-py.tar.gz`   | CI (GitHub Actions) |
+| macOS ARM64    | 17.2    | `gdb-macos-arm64-py.tar.gz`    | CI (GitHub Actions) |
+| windows-x86_64 | 17.2    | `gdb-windows-x86_64.tar.gz`    | CI (GitHub Actions) |
+
+Every archive holds the binary at the same relative path: `bin/gdb-multiarch-py`
+with Python scripting, `bin/gdb-multiarch.exe` on Windows. The plugin therefore
+needs no per-platform special case.
 
 Every archive comes with a `.sha256` file holding its checksum. All three are
 produced entirely in CI; there is no local build step left.
@@ -39,7 +43,8 @@ for that tag.
 **Trial run without a release** — Actions tab → *Build GDB* → *Run workflow*.
 The form offers four checkboxes, all ticked by default:
 
-- `with_python` — build the variant without Python scripting when unticked
+- `with_python` — build the variant without Python scripting when unticked.
+  Applies to linux and macOS only; Windows never builds with Python
 - `build_linux` / `build_macos` / `build_windows` — which platforms to build,
   so a trial run can be limited to the job you are working on
 
@@ -72,7 +77,8 @@ failure mode before `make` runs.
 Two consequences of the cross build:
 
 - the binary is installed as `m68k-elf-gdb`; the workflow renames it to
-  `bin/gdb`, which is what the plugin expects
+  `bin/gdb-multiarch-py` (or `bin/gdb-multiarch` without Python scripting),
+  the same name every platform ships
 - after `strip` the binary is ad-hoc signed (`codesign --force --sign -`),
   otherwise Gatekeeper blocks it on other machines
 
@@ -94,7 +100,7 @@ dependency:
    machines
 
 The *Portability check* step afterwards is a hard gate: a remaining
-`/opt/homebrew` reference in `bin/gdb` fails the build.
+`/opt/homebrew` reference in the binary fails the build.
 
 ### Windows: MSYS2 and static linking
 
@@ -106,13 +112,18 @@ once via the job's `defaults`. Dependencies come from pacman
 
 Native debugging is supported on x86_64 Windows, so unlike macOS no `--target`
 detour is needed — m68k comes from `--enable-targets=all`. The binary is
-`bin/gdb.exe`, and `LDFLAGS="-static"` keeps the mingw runtime DLLs
+`bin/gdb-multiarch.exe`, and `LDFLAGS="-static"` keeps the mingw runtime DLLs
 (`libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`) out of the image.
 Dependencies are inspected with `objdump -p | grep "DLL Name"` rather than
 `ldd`, which under MSYS2 reports the MSYS view instead of the PE imports. No
 code signing and no glibc check apply here.
 
 ### Python scripting
+
+This applies to linux and macOS. Windows is deliberately built without
+Python: the mingw interpreter cannot be linked statically, so the `-py`
+variant would drag a `libpython` DLL onto the target machine and defeat the
+`-static` linking that makes the Windows artifact self-contained.
 
 By default the build embeds the interpreter (`WITH_PYTHON: 'true'`),
 recognizable by the `-py` suffix in the asset name. Only this variant can run
@@ -130,8 +141,8 @@ The workflow aborts if any of these conditions is violated:
 - `gdb` is present as a build target in the generated Makefile
 - expat is active (`--with-expat` in `gdb --configuration`)
 - m68k appears in the architecture list (the SvNR's host architecture)
-- the embedded Python interpreter is actually operational
-- on macOS, `bin/gdb` contains no `/opt/homebrew` reference after relocation
+- the embedded Python interpreter is actually operational (linux and macOS)
+- on macOS, the binary contains no `/opt/homebrew` reference after relocation
 
 On Linux it additionally logs `ldd` and the highest referenced GLIBC symbol
 version, so the 2.31 limit can be traced in the log. On macOS the equivalent is
@@ -156,11 +167,11 @@ for the full license text.
 These checks run automatically in the workflow (see *Automated checks*). To
 repeat them by hand on a downloaded macOS bundle:
 
-1. **Portable**: `otool -L bin/gdb` shows only `@loader_path/...`,
+1. **Portable**: `otool -L bin/gdb-multiarch-py` shows only `@loader_path/...`,
    `/usr/lib/...` and `/System/...` references. No `/opt/homebrew/...` paths.
-2. **Multiarch**: `bin/gdb --batch -ex 'set architecture' 2>&1 | grep m68k`
+2. **Multiarch**: `bin/gdb-multiarch-py --batch -ex 'set architecture' 2>&1 | grep m68k`
    returns a hit (m68k is the SvNR's host architecture).
-3. **Functional**: `bin/gdb --version` prints "GNU gdb (GDB) 17.2".
+3. **Functional**: `bin/gdb-multiarch-py --version` prints "GNU gdb (GDB) 17.2".
 
 ## Plugin integration
 
@@ -171,27 +182,33 @@ URL of the current asset and checks its SHA256 sum.
 
 macOS, after the relocation step (self-contained):
 
-    gdb-macos-arm64-py/
-    ├── bin/gdb              # the actual binary (stripped, ad-hoc signed)
-    ├── lib/                 # rewritten dylibs (mpfr, gmp, ...)
-    ├── Frameworks/          # Python.framework (for Dolata's m/M scripts)
-    └── share/, include/     # data files from the install prefix
+    bin/gdb-multiarch-py     # the actual binary (stripped, ad-hoc signed)
+    lib/                     # rewritten dylibs (mpfr, gmp, ...)
+    Frameworks/              # Python.framework (for Dolata's m/M scripts)
+    share/, include/         # data files from the install prefix
 
 Linux and Windows (plain install prefix):
 
-    gdb-linux-x64-py/
-    ├── bin/gdb              # the actual binary (stripped; gdb.exe on Windows)
-    └── share/, include/     # data files from the install prefix
+    bin/gdb-multiarch-py     # the actual binary (stripped)
+    share/, include/         # data files from the install prefix
+
+The archives are flat: they unpack to `bin/`, `share/` and so on, without a
+platform-named directory in between. On Windows the binary is
+`bin/gdb-multiarch.exe`. It stays under `bin/` on purpose — GDB derives its
+data directory from the location of its own executable as `../share/gdb`, and
+a binary moved to the archive root would look for it one level too high, which
+breaks Python scripting.
 
 The exact layout is whatever `make install` puts under the prefix; the
 *Diagnostics after make* step prints it into the workflow log.
 
-Usage: extract the bundle anywhere and run `bin/gdb`. Remaining runtime
+Usage: extract the bundle anywhere and run the binary under `bin/`.
+Remaining runtime
 dependencies per platform:
 
 - **macOS**: none. Homebrew dylibs and, in the `-py` variant, the Python
   framework travel inside the bundle
 - **Linux**: the target system's `glibc` (≤ 2.31 required at build time) and,
   for the `-py` variant, `libpython3.8`
-- **Windows**: nothing beyond the system DLLs thanks to `-static`, except the
-  mingw Python DLL in the `-py` variant
+- **Windows**: nothing beyond the system DLLs thanks to `-static` — there is
+  no `-py` variant here, so no mingw Python DLL either
