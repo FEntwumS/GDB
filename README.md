@@ -114,11 +114,21 @@ once via the job's `defaults`. Dependencies come from pacman
 
 Native debugging is supported on x86_64 Windows, so unlike macOS no `--target`
 detour is needed — m68k comes from `--enable-targets=all`. The binary is
-`bin/gdb-multiarch.exe`, and `LDFLAGS="-static"` keeps the mingw runtime DLLs
-(`libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`) out of the image.
+`bin/gdb-multiarch.exe`. `LDFLAGS="-static"` is passed but does not reach the
+final link of gdb, so the binary keeps importing the UCRT64 libraries
+(`libexpat-1`, `libgmp-10`, `libmpfr-6`, `libncursesw6`, `libiconv-2`, `zlib1`,
+`libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`). The *Bundle mingw DLLs*
+step therefore copies them next to the binary — transitively, discovered from
+the image rather than hardcoded — which works because Windows searches the
+directory of the executable before the system ones. This mirrors what the macOS
+job does with its Homebrew dylibs.
+
 Dependencies are inspected with `objdump -p | grep "DLL Name"` rather than
-`ldd`, which under MSYS2 reports the MSYS view instead of the PE imports. No
-code signing and no glibc check apply here.
+`ldd`, which under MSYS2 reports the MSYS view instead of the PE imports. The
+*Portability check* is a hard gate: every imported DLL that exists under
+`/ucrt64/bin` must also sit in `bin/`. It used to be a mere warning, and that
+is how v0.3.1 shipped a binary that could not start without MSYS2 while CI
+stayed green. No code signing and no glibc check apply here.
 
 ### Python scripting
 
@@ -145,6 +155,7 @@ The workflow aborts if any of these conditions is violated:
 - m68k appears in the architecture list (the SvNR's host architecture)
 - the embedded Python interpreter is actually operational (linux and macOS)
 - on macOS, the binary contains no `/opt/homebrew` reference after relocation
+- on Windows, every imported mingw DLL is bundled next to the binary
 
 On Linux it additionally logs `ldd` and the highest referenced GLIBC symbol
 version, so the 2.31 limit can be traced in the log. On macOS the equivalent is

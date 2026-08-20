@@ -184,6 +184,7 @@ jobs:
             --disable-gold \
             --disable-gprof \
             --disable-sim \
+            --disable-gdbserver \
             --disable-nls \
             --disable-source-highlight \
             --disable-werror \
@@ -405,6 +406,7 @@ jobs:
             --disable-gold \
             --disable-gprof \
             --disable-sim \
+            --disable-gdbserver \
             --disable-nls \
             --disable-source-highlight \
             --disable-werror
@@ -751,6 +753,7 @@ jobs:
             --disable-gold \
             --disable-gprof \
             --disable-sim \
+            --disable-gdbserver \
             --disable-nls \
             --disable-source-highlight \
             --disable-werror \
@@ -782,6 +785,46 @@ jobs:
           # bin/gdb-multiarch.exe without knowing which archive it unpacked.
           mv "${WORK}/gdb-windows-x86_64/bin/gdb.exe" \
              "${WORK}/gdb-windows-x86_64/bin/gdb-multiarch.exe"
+
+          # Everything else make install drops into bin/ (gdbserver.exe if the
+          # --disable above was ignored, gdb-add-index, ...) is dead weight for
+          # this artifact and only confuses whoever unpacks it.
+          find "${WORK}/gdb-windows-x86_64/bin" -maxdepth 1 -type f \
+            ! -name "gdb-multiarch.exe" -delete
+
+      - name: Bundle mingw DLLs
+        # LDFLAGS="-static" does not reach the final link of gdb, so the binary
+        # imports the UCRT64 libraries (libexpat-1, libgmp-10, libmpfr-6,
+        # libncursesw6, libiconv-2, zlib1, libstdc++-6, libgcc_s_seh-1,
+        # libwinpthread-1). None of those exist on a machine without MSYS2, and
+        # Windows searches the directory of the executable before the system
+        # ones -- so the fix is to ship them next to the binary, the same way
+        # the macOS job pulls its Homebrew dylibs into the bundle.
+        #
+        # Fixed-point iteration: a copied DLL can pull in further ones.
+        # Only names that exist under /ucrt64/bin are copied, which
+        # automatically skips the Windows system DLLs.
+        run: |
+          WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
+          BIN="${WORK}/gdb-windows-x86_64/bin"
+
+          while :; do
+            NEW=0
+            for f in "$BIN"/*.exe "$BIN"/*.dll; do
+              [ -f "$f" ] || continue
+              for dep in $(objdump -p "$f" | sed -n "s/.*DLL Name: //p"); do
+                if [ -f "/ucrt64/bin/$dep" ] && [ ! -f "$BIN/$dep" ]; then
+                  cp "/ucrt64/bin/$dep" "$BIN/$dep"
+                  echo "copied $dep"
+                  NEW=1
+                fi
+              done
+            done
+            [ "$NEW" -eq 0 ] && break
+          done
+
+          echo "--- bin/ after bundling ---"
+          ls -lh "$BIN"
 
       - name: Diagnostics after make
         # For traceability only: which modules were actually built, and
@@ -825,23 +868,36 @@ jobs:
              && echo "OK: m68k architecture available" \
              || { echo "::error::m68k architecture unavailable"; exit 1; }
 
-      - name: Portability report (MSYS2 runtime DLLs)
-        # Deliberately a warning, not an error: LDFLAGS="-static" should have
-        # removed these, and without Python in this job there is no remaining
-        # reason for a dynamic mingw dependency -- but a warning is easier to
-        # read in the log than a failed run.
+      - name: Portability check (every mingw DLL is bundled)
+        # A hard gate, not a report. The previous version only warned when the
+        # binary imported mingw DLLs, so a release shipped that could not start
+        # on a machine without MSYS2 while CI stayed green.
+        #
+        # The rule: every imported DLL that exists under /ucrt64/bin must also
+        # sit next to the binary. Names that are not in /ucrt64/bin are Windows
+        # system DLLs (KERNEL32, USER32, WS2_32, bcrypt, api-ms-win-crt-*) and
+        # are supplied by the target machine.
         run: |
           WORK="$(cygpath -u "${GITHUB_WORKSPACE}")"
-          GDB="${WORK}/gdb-windows-x86_64/bin/gdb-multiarch.exe"
+          BIN="${WORK}/gdb-windows-x86_64/bin"
 
-          DLLS="$(objdump -p "$GDB" | grep -i "DLL Name" | sort -u)"
-          HITS="$(echo "$DLLS" | grep -iE 'libstdc\+\+|libgcc_s|libwinpthread|msys-2\.0' || true)"
-          if [ -n "$HITS" ]; then
-            echo "::warning::binary depends on MSYS2/mingw runtime DLLs - -static did not take full effect"
-            echo "$HITS"
-          else
-            echo "OK: no MSYS2/mingw runtime DLLs referenced"
+          MISSING=""
+          for f in "$BIN"/*.exe "$BIN"/*.dll; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") ---"
+            objdump -p "$f" | sed -n "s/.*DLL Name: //p" | sort -u
+            for dep in $(objdump -p "$f" | sed -n "s/.*DLL Name: //p"); do
+              if [ -f "/ucrt64/bin/$dep" ] && [ ! -f "$BIN/$dep" ]; then
+                MISSING="$MISSING $dep"
+              fi
+            done
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::these mingw DLLs are imported but not bundled:$MISSING"
+            exit 1
           fi
+          echo "OK: every mingw DLL the binaries need is present in bin/"
 
       - name: Package
         # .zip instead of .tar.gz on Windows: the target audience extracts by
