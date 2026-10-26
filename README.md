@@ -12,13 +12,13 @@ SvNR debugger plugin uses.
 
 | Platform       | Version | Release asset                  | Produced by         |
 |----------------|---------|--------------------------------|---------------------|
-| linux-x86_64   | 17.2    | `gdb-linux-x86_64-py.tar.gz`   | CI (GitHub Actions) |
-| macOS ARM64    | 17.2    | `gdb-macos-arm64-py.tar.gz`    | CI (GitHub Actions) |
+| linux-x86_64   | 17.2    | `gdb-linux-x86_64.tar.gz`      | CI (GitHub Actions) |
+| macOS ARM64    | 17.2    | `gdb-macos-arm64.tar.gz`       | CI (GitHub Actions) |
 | windows-x86_64 | 17.2    | `gdb-windows-x86_64.zip`       | CI (GitHub Actions) |
 
-Every archive holds the binary at the same relative path: `bin/gdb-multiarch-py`
-with Python scripting, `bin/gdb-multiarch.exe` on Windows. The plugin therefore
-needs no per-platform special case.
+Since v0.4.0 all three are built without Python scripting. Every archive holds
+the binary at the same relative path: `bin/gdb-multiarch`, `bin/gdb-multiarch.exe`
+on Windows. The plugin therefore needs no per-platform special case.
 
 Every archive comes with a `.sha256` file holding its checksum. Windows ships
 as `.zip` -- double-click extraction without an extra tool -- the other two
@@ -35,20 +35,21 @@ flags and verification differ too much per platform.
 
 **Triggering a release** — a tag matching `v*` starts the workflow:
 
-    git tag v17.2-1
-    git push origin v17.2-1
+    git tag v0.4.1
+    git push origin v0.4.1
 
 The workflow builds GDB from the official GNU sources, verifies the result,
 and automatically attaches the archive and its checksum to the GitHub release
-for that tag.
+for that tag. Creating the release on GitHub first (web UI or
+`gh release create`) pushes the tag as well and starts the same run.
 
 **Trial run without a release** — Actions tab → *Build GDB* → *Run workflow*.
-The form offers four checkboxes, all ticked by default:
+The form offers four checkboxes:
 
-- `with_python` — build the variant without Python scripting when unticked.
+- `with_python` — unticked by default; tick it to build the `-py` variant.
   Applies to linux and macOS only; Windows never builds with Python
-- `build_linux` / `build_macos` / `build_windows` — which platforms to build,
-  so a trial run can be limited to the job you are working on
+- `build_linux` / `build_macos` / `build_windows` — ticked by default; which
+  platforms to build, so a trial run can be limited to the job you are working on
 
 The platform checkboxes only affect a manual start. A tag push always builds
 all three. The result is kept for 30 days as a workflow artifact, without
@@ -79,7 +80,7 @@ failure mode before `make` runs.
 Two consequences of the cross build:
 
 - the binary is installed as `m68k-elf-gdb`; the workflow renames it to
-  `bin/gdb-multiarch-py` (or `bin/gdb-multiarch` without Python scripting),
+  `bin/gdb-multiarch` (or `bin/gdb-multiarch-py` with Python scripting),
   the same name every platform ships
 - after `strip` the binary is ad-hoc signed (`codesign --force --sign -`),
   otherwise Gatekeeper blocks it on other machines
@@ -137,13 +138,17 @@ Python: the mingw interpreter cannot be linked statically, so the `-py`
 variant would drag a `libpython` DLL onto the target machine and defeat the
 `-static` linking that makes the Windows artifact self-contained.
 
-By default the build embeds the interpreter (`WITH_PYTHON: 'true'`),
-recognizable by the `-py` suffix in the asset name. Only this variant can run
-GDB Python scripts, such as the RAM commands from the preliminary work. The
-price is a dynamic dependency on exactly `libpython3.8` — matching the VM
-image, but not arbitrary systems; the standard library is not included in the
-bundle. The variant without Python (asset without the suffix) is leaner and
-sufficient as long as the data is displayed in the user interface.
+By default the build leaves the interpreter out (`WITH_PYTHON: 'false'`). The
+OneWare debugger talks to GDB only through the machine interface and runs no
+Python scripts, so the leaner variant is all it needs.
+
+The `-py` variant embeds the interpreter and is recognizable by the suffix in
+the asset name. Only this variant can run GDB Python scripts, such as the RAM
+commands from the preliminary work. The price is a dynamic dependency on
+exactly `libpython3.8` — matching the VM image, but not arbitrary systems; the
+binary does not start where that version is missing, and the standard library
+is not included in the bundle. Up to v0.3.2 the linux and macOS assets were
+this variant.
 
 ### Automated checks
 
@@ -153,7 +158,7 @@ The workflow aborts if any of these conditions is violated:
 - `gdb` is present as a build target in the generated Makefile
 - expat is active (`--with-expat` in `gdb --configuration`)
 - m68k appears in the architecture list (the SvNR's host architecture)
-- the embedded Python interpreter is actually operational (linux and macOS)
+- the embedded Python interpreter is actually operational (`-py` variant only)
 - on macOS, the binary contains no `/opt/homebrew` reference after relocation
 - on Windows, every imported mingw DLL is bundled next to the binary
 
@@ -164,10 +169,10 @@ version, so the 2.31 limit can be traced in the log. On macOS the equivalent is
 ## Origin and license
 
 All three artifacts are based on GDB 17.2 and are built in CI directly from the
-official sources of the Free Software Foundation. On macOS, `gmp`, `mpfr` and
-Python come from [Homebrew](https://brew.sh) and are bundled into the artifact
-by the relocation step. The underlying GDB sources are available from the Free
-Software Foundation:
+official sources of the Free Software Foundation. On macOS, `gmp`, `mpfr` and,
+for the `-py` variant, Python come from [Homebrew](https://brew.sh) and are
+bundled into the artifact by the relocation step. The underlying GDB sources
+are available from the Free Software Foundation:
 
     https://ftp.gnu.org/gnu/gdb/gdb-17.2.tar.xz
 
@@ -180,29 +185,33 @@ for the full license text.
 These checks run automatically in the workflow (see *Automated checks*). To
 repeat them by hand on a downloaded macOS bundle:
 
-1. **Portable**: `otool -L bin/gdb-multiarch-py` shows only `@loader_path/...`,
+1. **Portable**: `otool -L bin/gdb-multiarch` shows only `@loader_path/...`,
    `/usr/lib/...` and `/System/...` references. No `/opt/homebrew/...` paths.
-2. **Multiarch**: `bin/gdb-multiarch-py --batch -ex 'set architecture' 2>&1 | grep m68k`
+2. **Multiarch**: `bin/gdb-multiarch --batch -ex 'set architecture' 2>&1 | grep m68k`
    returns a hit (m68k is the SvNR's host architecture).
-3. **Functional**: `bin/gdb-multiarch-py --version` prints "GNU gdb (GDB) 17.2".
+3. **Functional**: `bin/gdb-multiarch --version` prints "GNU gdb (GDB) 17.2".
 
 ## Plugin integration
 
-In `oneware-extension.json`, the SvNR debugger plugin points at the release
-URL of the current asset and checks its SHA256 sum.
+The SvNR debugger plugin declares GDB as a package in
+`FEntwumsSvnrExtensionModule.cs` (`GdbPackage`) of
+[FEntwumS.SVNRExtension](https://github.com/FEntwumS/FEntwumS.SVNRExtension)
+and points at the release URLs of the current assets, since package 1.0.3 at
+v0.4.0. The package manager does not check the `.sha256` files; they are there
+for manual verification.
 
 ## Shipped bundle
 
 macOS, after the relocation step (self-contained):
 
-    bin/gdb-multiarch-py     # the actual binary (stripped, ad-hoc signed)
+    bin/gdb-multiarch        # the actual binary (stripped, ad-hoc signed)
     lib/                     # rewritten dylibs (mpfr, gmp, ...)
-    Frameworks/              # Python.framework (for Dolata's m/M scripts)
+    Frameworks/              # -py variant only: Python.framework (for Dolata's m/M scripts)
     share/, include/         # data files from the install prefix
 
 Linux and Windows (plain install prefix):
 
-    bin/gdb-multiarch-py     # the actual binary (stripped)
+    bin/gdb-multiarch        # the actual binary (stripped)
     share/, include/         # data files from the install prefix
 
 The archives are flat: they unpack to `bin/`, `share/` and so on, without a
