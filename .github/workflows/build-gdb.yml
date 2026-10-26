@@ -24,7 +24,7 @@ on:
       with_python:
         description: 'Enable Python scripting (linux and macos only)'
         type: boolean
-        default: true
+        default: false
       # Platform switches, so a manual run can be limited to the job you are
       # actually working on instead of burning three runners every time.
       # These only apply to a manual start -- a tag push always builds all
@@ -72,7 +72,7 @@ env:
   # Applies to the linux and macos jobs only. Windows is built without Python
   # on purpose: the mingw interpreter cannot be linked statically, so the -py
   # variant would drag a libpython DLL along and defeat LDFLAGS="-static".
-  WITH_PYTHON: 'true'
+  WITH_PYTHON: 'false'
 
 jobs:
   build-linux:
